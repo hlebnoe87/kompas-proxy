@@ -20,7 +20,6 @@ app.all('/proxy/*', async (req, res) => {
   try {
     const headers = {
       'Authorization': 'Bearer ' + process.env.MS_TOKEN,
-      'Accept-Encoding': 'identity'
     };
 
     if (req.method === 'POST' || req.method === 'PUT') {
