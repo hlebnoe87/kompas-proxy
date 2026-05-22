@@ -4,7 +4,6 @@ const app = express();
 
 app.use(express.json());
 
-// CORS для всех запросов
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -13,23 +12,23 @@ app.use((req, res, next) => {
   next();
 });
 
-// Прокси всех методов к МоемуСкладу
 app.all('/proxy/*', async (req, res) => {
   const path = req.path.replace('/proxy', '');
   const query = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
   const msUrl = 'https://api.moysklad.ru/api/remap/1.2' + path + query;
 
   try {
-    const options = {
-      method: req.method,
-      headers: {
-        'Authorization': 'Bearer ' + process.env.MS_TOKEN,
-        'Content-Type': 'application/json',
-        'Accept-Encoding': 'identity'
-      }
+    const headers = {
+      'Authorization': 'Bearer ' + process.env.MS_TOKEN,
+      'Accept-Encoding': 'identity'
     };
 
-    // Добавляем тело только для POST и PUT
+    if (req.method === 'POST' || req.method === 'PUT') {
+      headers['Content-Type'] = 'application/json';
+    }
+
+    const options = { method: req.method, headers };
+
     if ((req.method === 'POST' || req.method === 'PUT') && req.body) {
       options.body = JSON.stringify(req.body);
     }
