@@ -36,20 +36,21 @@ app.all('/proxy/*', async (req, res) => {
   }
 });
 
-// ── Альфа-Банк Эквайринг (тестовая среда) ──
+// ── Альфа-Банк Эквайринг ──
 app.post('/payment/*', async (req, res) => {
   const path    = req.path.replace('/payment', '');
   const alfaUrl = 'https://alfa.rbsuat.com/payment/rest' + path;
 
-  // Подставляем credentials — клиент их не видит
   const params = new URLSearchParams({
     ...req.body,
     userName: process.env.ALFA_USER || 'r-kompas87-api',
     password: process.env.ALFA_PASS || 'r-kompas87*?1',
   });
 
+  console.log('PAYMENT URL:', alfaUrl);
+  console.log('PAYMENT PARAMS:', params.toString());
+
   try {
-    console.log('PAYMENT', alfaUrl);
     const response = await fetch(alfaUrl, {
       method:  'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
