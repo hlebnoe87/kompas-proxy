@@ -44,7 +44,7 @@ app.post('/payment/*', async (req, res) => {
   const params = new URLSearchParams({
     ...req.body,
     userName: process.env.ALFA_USER || 'r-kompas87-api',
-    password: process.env.ALFA_PASS || 'r-kompas87*?1',
+    password: process.env.ALFA_PASS || 'kompas87*?1',
   });
 
   console.log('PAYMENT URL:', alfaUrl);
