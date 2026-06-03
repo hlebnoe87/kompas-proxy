@@ -36,6 +36,29 @@ app.all('/proxy/*', async (req, res) => {
   }
 });
 
+
+// ── Проверка статуса платежа Альфа-Банк ──
+app.post('/payment/getOrderStatus.do', async (req, res) => {
+  const alfaUrl = 'https://alfa.rbsuat.com/payment/rest/getOrderStatus.do';
+  const params = new URLSearchParams({
+    ...req.body,
+    userName: process.env.ALFA_USER || 'r-kompas87-api',
+    password: process.env.ALFA_PASS || 'kompas87*?1',
+  });
+  try {
+    const response = await fetch(alfaUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString()
+    });
+    const data = await response.json();
+    console.log('STATUS RESPONSE:', JSON.stringify(data));
+    res.json(data);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Альфа-Банк Эквайринг ──
 app.post('/payment/*', async (req, res) => {
   const path    = req.path.replace('/payment', '');
