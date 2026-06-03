@@ -56,6 +56,7 @@ app.post('/payment/*', async (req, res) => {
       body:    params.toString()
     });
     const data = await response.json();
+    console.log('PAYMENT RESPONSE:', JSON.stringify(data));
     res.json(data);
   } catch(e) {
     res.status(500).json({ error: e.message });
