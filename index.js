@@ -163,5 +163,26 @@ app.post('/webhook/moysklad', async (req, res) => {
   }
 });
 
+
+// ── Проксирование изображений МоегоСклада ──
+app.get('/miniature/*', async (req, res) => {
+  const path  = req.path.replace('/miniature', '');
+  const query = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+  const imgUrl = 'https://miniature-prod.moysklad.ru' + path + query;
+  try {
+    const response = await fetch(imgUrl, {
+      headers: { 'Authorization': 'Bearer ' + process.env.MS_TOKEN }
+    });
+    if (!response.ok) { res.status(response.status).send(''); return; }
+    const buffer = await response.buffer();
+    const contentType = response.headers.get('content-type') || 'image/jpeg';
+    res.set('Content-Type', contentType);
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(buffer);
+  } catch(e) {
+    res.status(500).send('');
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Kompas Proxy running on port ' + PORT));
