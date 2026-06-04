@@ -2,10 +2,6 @@
   "name": "kompas-proxy",
   "version": "1.0.0",
   "main": "index.js",
-  "dependencies": {
-    "express": "^4.18.2",
-    "node-fetch": "^2.6.9"
- {
   "scripts": {
     "start": "node index.js"
   },
