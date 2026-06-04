@@ -5,14 +5,9 @@ meta:
     version: "18"
 build:
   skip: false
-  additionalCommands: node index.js
-  artifacts:
-    "*": /
+  additionalCommands: npm install
 run:
   persistenceMount: /data
-  scriptName: null
-  scriptArguments: null
-  nodeArguments: null
-  command: npm run start
+  command: node index.js
   containerPort: 3000
-  servicePort: 80
+  servicePort: 3000
