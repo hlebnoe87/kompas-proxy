@@ -3,13 +3,13 @@ meta:
   toolchain:
     name: npm
     version: 18
-
+ 
 build:
-  nixPacks: false
-  buildCommands:
+  installCommands:
     - npm install
-
+ 
 run:
   persistenceMount: /data
   containerPort: 3000
   command: node index.js
+ 
