@@ -1,1 +1,15 @@
+meta:
+  environment: node
+  toolchain:
+    name: npm
+    version: 18
 
+build:
+  nixPacks: false
+  buildCommands:
+    - npm install
+
+run:
+  persistenceMount: /data
+  containerPort: 3000
+  command: node index.js
