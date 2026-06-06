@@ -224,5 +224,79 @@ app.post('/sms/verify', async (req, res) => {
   res.json({ ok: true, phone });
 });
 
+
+// ── Восстановление пароля по email ──
+const nodemailer = require('nodemailer');
+
+app.post('/mail/recovery', async (req, res) => {
+  const email   = (req.body.email || '').trim();
+  const agentId = req.body.agentId;
+  if (!email || !agentId) {
+    return res.status(400).json({ error: 'Не указан email' });
+  }
+
+  try {
+    // Получаем пароль контрагента из МоегоСклада
+    const agentR = await fetch('https://api.moysklad.ru/api/remap/1.2/entity/counterparty/' + agentId, {
+      headers: { 'Authorization': 'Bearer ' + process.env.MS_TOKEN }
+    });
+    const agent = await agentR.json();
+    const passAttr = agent.attributes && agent.attributes.find(a => a.name === 'Пароль');
+
+    // Пароль хранится в виде хеша — восстановить нельзя, генерируем новый
+    // Генерируем временный пароль
+    const newPass = Math.random().toString(36).slice(-8);
+
+    // Обновляем пароль контрагента (хеш на стороне приложения, тут простой)
+    // Сохраняем новый пароль как есть в атрибут (приложение хеширует при входе — нужен сырой)
+    // Поэтому отправляем сырой пароль и сохраняем его хеш
+    function hashPass(pass) {
+      let h = 0; const str = 'kompas87_' + pass;
+      for (let i = 0; i < str.length; i++) { h = ((h << 5) - h) + str.charCodeAt(i); h |= 0; }
+      return 'h' + Math.abs(h).toString(36);
+    }
+
+    if (passAttr) {
+      await fetch('https://api.moysklad.ru/api/remap/1.2/entity/counterparty/' + agentId, {
+        method: 'PUT',
+        headers: { 'Authorization': 'Bearer ' + process.env.MS_TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ attributes: [{ meta: passAttr.meta, value: hashPass(newPass) }] })
+      });
+    }
+
+    // Отправляем письмо
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.mail.ru',
+      port: 465,
+      secure: true,
+      auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS }
+    });
+
+    await transporter.sendMail({
+      from: '"Компас.Доставка" <' + process.env.MAIL_USER + '>',
+      to: email,
+      subject: 'Восстановление доступа — Компас.Доставка',
+      text: 'Здравствуйте!\n\nВаш новый пароль для входа в приложение Компас.Доставка:\n\n' + newPass +
+            '\n\n⚠️ Никому не сообщайте свой пароль от аккаунта.\n\nЕсли вы не запрашивали восстановление — проигнорируйте это письмо.\n\nС уважением,\nКоманда Компас.Доставка',
+      html: '<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto">' +
+            '<div style="background:#1F9B5E;color:#fff;padding:20px;border-radius:12px 12px 0 0;text-align:center">' +
+            '<h2 style="margin:0">Компас.Доставка</h2></div>' +
+            '<div style="padding:24px;background:#f9f9f9;border-radius:0 0 12px 12px">' +
+            '<p>Здравствуйте!</p>' +
+            '<p>Ваш новый пароль для входа в приложение:</p>' +
+            '<div style="background:#fff;border:2px solid #1F9B5E;border-radius:10px;padding:16px;text-align:center;font-size:24px;font-weight:bold;letter-spacing:2px;color:#1F9B5E;margin:16px 0">' + newPass + '</div>' +
+            '<p style="color:#E24B4A;font-weight:bold">⚠️ Никому не сообщайте свой пароль от аккаунта.</p>' +
+            '<p style="color:#888;font-size:13px">Если вы не запрашивали восстановление — проигнорируйте это письмо.</p>' +
+            '</div></div>'
+    });
+
+    console.log('Письмо восстановления отправлено на', email);
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('Mail recovery error:', e.message);
+    res.status(500).json({ error: 'Не удалось отправить письмо' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Kompas Proxy running on port ' + PORT));
