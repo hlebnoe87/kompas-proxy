@@ -298,5 +298,92 @@ app.post('/mail/recovery', async (req, res) => {
   }
 });
 
+
+// ── TELEGRAM ВХОД (вариант Б — запрос контакта) ──
+const tgSessions = new Map(); // sessionId → { phone, status, tgPhone, expires }
+
+// 1. Приложение создаёт сессию подтверждения
+app.post('/tg/start', (req, res) => {
+  const phone = (req.body.phone || '').replace(/\D/g, '');
+  if (!phone || phone.length < 10) return res.status(400).json({ error: 'Неверный номер' });
+  const sessionId = Math.random().toString(36).slice(2, 10);
+  tgSessions.set(sessionId, { phone, status: 'pending', expires: Date.now() + 10*60*1000 });
+  res.json({ ok: true, sessionId, botUrl: 'https://t.me/kompas87_bot?start=' + sessionId });
+});
+
+// 2. Приложение опрашивает статус подтверждения
+app.get('/tg/status/:sessionId', (req, res) => {
+  const s = tgSessions.get(req.params.sessionId);
+  if (!s) return res.json({ status: 'expired' });
+  if (Date.now() > s.expires) { tgSessions.delete(req.params.sessionId); return res.json({ status: 'expired' }); }
+  res.json({ status: s.status, phone: s.phone });
+});
+
+// 3. Webhook от Telegram — клиент поделился контактом
+app.post('/tg/webhook', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const update = req.body;
+    const msg = update.message;
+    if (!msg) return;
+    const chatId = msg.chat && msg.chat.id;
+    const TG_TOKEN = process.env.TG_BOT_TOKEN;
+
+    // Команда /start с кодом сессии
+    if (msg.text && msg.text.startsWith('/start')) {
+      const parts = msg.text.split(' ');
+      const sessionId = parts[1] || '';
+      // Запоминаем chatId для этой сессии
+      const s = tgSessions.get(sessionId);
+      if (s) s.chatId = chatId;
+      // Просим поделиться контактом
+      await tgSend(TG_TOKEN, chatId,
+        'Здравствуйте! Для входа в Компас.Доставка подтвердите свой номер телефона.\n\nНажмите кнопку ниже 👇',
+        {
+          keyboard: [[{ text: '📱 Поделиться контактом', request_contact: true }]],
+          resize_keyboard: true, one_time_keyboard: true
+        });
+      return;
+    }
+
+    // Клиент поделился контактом
+    if (msg.contact && msg.contact.phone_number) {
+      const tgPhone = msg.contact.phone_number.replace(/\D/g, '');
+      // Ищем сессию по chatId
+      let matched = null;
+      for (const [sid, s] of tgSessions.entries()) {
+        if (s.chatId === chatId && s.status === 'pending') { matched = { sid, s }; break; }
+      }
+      if (!matched) {
+        await tgSend(TG_TOKEN, chatId, 'Сессия не найдена. Вернитесь в приложение и начните заново.');
+        return;
+      }
+      // Сверяем номера (последние 10 цифр)
+      if (tgPhone.slice(-10) === matched.s.phone.slice(-10)) {
+        matched.s.status = 'confirmed';
+        matched.s.tgPhone = tgPhone;
+        await tgSend(TG_TOKEN, chatId, '✅ Номер подтверждён! Вернитесь в приложение — вход выполнен.', { remove_keyboard: true });
+      } else {
+        await tgSend(TG_TOKEN, chatId,
+          '❌ Номер не совпадает с тем, что вы ввели в приложении.\n\nВы ввели: +' + matched.s.phone +
+          '\nВ Telegram: +' + tgPhone + '\n\nПроверьте номер в приложении.', { remove_keyboard: true });
+      }
+    }
+  } catch(e) {
+    console.error('TG webhook error:', e.message);
+  }
+});
+
+// Отправка сообщения в Telegram
+async function tgSend(token, chatId, text, replyMarkup) {
+  try {
+    await fetch('https://api.telegram.org/bot' + token + '/sendMessage', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text, reply_markup: replyMarkup || undefined })
+    });
+  } catch(e) { console.error('tgSend:', e.message); }
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Kompas Proxy running on port ' + PORT));
