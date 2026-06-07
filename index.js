@@ -319,24 +319,37 @@ app.get('/tg/status/:sessionId', (req, res) => {
   res.json({ status: s.status, phone: s.phone });
 });
 
-// 3. Webhook от Telegram — клиент поделился контактом
-app.post('/tg/webhook', async (req, res) => {
-  res.sendStatus(200);
+// 3. POLLING — прокси сам опрашивает Telegram (webhook не работает на Amvera)
+let tgOffset = 0;
+async function tgPoll() {
+  const TG_TOKEN = process.env.TG_BOT_TOKEN;
+  if (!TG_TOKEN) return;
   try {
-    const update = req.body;
+    const r = await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/getUpdates?offset=' + tgOffset + '&timeout=20', {
+      signal: AbortSignal.timeout(25000)
+    });
+    const data = await r.json();
+    if (!data.ok || !data.result) return;
+    for (const update of data.result) {
+      tgOffset = update.update_id + 1;
+      await tgHandleUpdate(update, TG_TOKEN);
+    }
+  } catch(e) {
+    // таймаут long-polling — нормально
+  }
+}
+
+async function tgHandleUpdate(update, TG_TOKEN) {
+  try {
     const msg = update.message;
     if (!msg) return;
     const chatId = msg.chat && msg.chat.id;
-    const TG_TOKEN = process.env.TG_BOT_TOKEN;
 
-    // Команда /start с кодом сессии
     if (msg.text && msg.text.startsWith('/start')) {
       const parts = msg.text.split(' ');
       const sessionId = parts[1] || '';
-      // Запоминаем chatId для этой сессии
       const s = tgSessions.get(sessionId);
       if (s) s.chatId = chatId;
-      // Просим поделиться контактом
       await tgSend(TG_TOKEN, chatId,
         'Здравствуйте! Для входа в Компас.Доставка подтвердите свой номер телефона.\n\nНажмите кнопку ниже 👇',
         {
@@ -346,10 +359,8 @@ app.post('/tg/webhook', async (req, res) => {
       return;
     }
 
-    // Клиент поделился контактом
     if (msg.contact && msg.contact.phone_number) {
       const tgPhone = msg.contact.phone_number.replace(/\D/g, '');
-      // Ищем сессию по chatId
       let matched = null;
       for (const [sid, s] of tgSessions.entries()) {
         if (s.chatId === chatId && s.status === 'pending') { matched = { sid, s }; break; }
@@ -358,7 +369,6 @@ app.post('/tg/webhook', async (req, res) => {
         await tgSend(TG_TOKEN, chatId, 'Сессия не найдена. Вернитесь в приложение и начните заново.');
         return;
       }
-      // Сверяем номера (последние 10 цифр)
       if (tgPhone.slice(-10) === matched.s.phone.slice(-10)) {
         matched.s.status = 'confirmed';
         matched.s.tgPhone = tgPhone;
@@ -370,9 +380,12 @@ app.post('/tg/webhook', async (req, res) => {
       }
     }
   } catch(e) {
-    console.error('TG webhook error:', e.message);
+    console.error('TG update error:', e.message);
   }
-});
+}
+
+// Запускаем цикл polling
+setInterval(tgPoll, 1000);
 
 // Отправка сообщения в Telegram
 async function tgSend(token, chatId, text, replyMarkup) {
