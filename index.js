@@ -52,6 +52,7 @@ const ALLOWED_MS_PATHS = [
   '/entity/store',
   '/entity/retailstore',
   '/entity/product',
+  '/entity/demand',
   '/entity/employee',
   '/entity/organization',
   '/entity/currency',
