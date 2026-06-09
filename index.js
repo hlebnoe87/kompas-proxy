@@ -399,5 +399,29 @@ async function tgSend(token, chatId, text, replyMarkup) {
   } catch(e) { console.error('tgSend:', e.message); }
 }
 
+
+// ── ВХОД СБОРЩИКОВ ПО PIN ──
+// Сборщики хранятся в env SBORKA_USERS в формате: PIN:Имя,PIN:Имя
+// Пример: 1234:Иван Петров,5678:Мария Сидорова
+function getSborkaUsers() {
+  const raw = process.env.SBORKA_USERS || '';
+  const users = {};
+  raw.split(',').forEach(pair => {
+    const [pin, ...nameParts] = pair.split(':');
+    if (pin && nameParts.length) users[pin.trim()] = nameParts.join(':').trim();
+  });
+  return users;
+}
+
+app.post('/sborka/login', (req, res) => {
+  const pin = (req.body.pin || '').trim();
+  const users = getSborkaUsers();
+  if (users[pin]) {
+    res.json({ ok: true, name: users[pin], pin });
+  } else {
+    res.status(401).json({ error: 'Неверный PIN-код' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Kompas Proxy running on port ' + PORT));
