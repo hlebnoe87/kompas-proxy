@@ -486,28 +486,58 @@ const ORDER_MSG = {
 // Следим за сменой статуса активных заказов и шлём уведомление в Telegram
 const orderStageSeen = new Map(); // orderId → последняя замеченная стадия
 let orderWatchBaseline = false;   // первый прогон — базовая линия (без рассылки)
+let _lastWatch = { at: null, rows: 0, changed: 0, sent: 0, error: null };
 async function watchOrderStatuses() {
   if (!process.env.TG_BOT_TOKEN || !process.env.MS_TOKEN) return;
   try {
     const r = await fetch(MS_API + '/entity/customerorder?limit=100&order=updated,desc&expand=state,agent', { headers: msAuthHeaders() });
     const data = await r.json();
-    for (const o of (data.rows || [])) {
+    const rows = data.rows || [];
+    let changed = 0, sent = 0;
+    for (const o of rows) {
       const stage = stageFromStateName(o.state && o.state.name);
       const prev  = orderStageSeen.get(o.id);
       orderStageSeen.set(o.id, stage);
       if (!orderWatchBaseline) continue;                  // первый прогон — только запоминаем
       if (prev === undefined || prev === stage) continue; // нет смены статуса
+      changed++;
       const make = ORDER_MSG[stage];
       if (!make) continue;                                // эту стадию не уведомляем
       const chatId = await getChatIdForOrder(o);
       if (!chatId) continue;                              // у клиента нет привязанного Telegram
       await tgSend(process.env.TG_BOT_TOKEN, chatId, make(o.name || ''));
+      sent++;
       console.log('TG notify:', o.name, '→ stage', stage, 'chat', chatId);
     }
     orderWatchBaseline = true;
-  } catch(e) { console.error('watchOrderStatuses:', e.message); }
+    _lastWatch = { at: new Date().toISOString(), rows: rows.length, changed, sent, error: rows.length ? null : 'no rows' };
+  } catch(e) {
+    _lastWatch = { at: new Date().toISOString(), rows: 0, changed: 0, sent: 0, error: e.message };
+    console.error('watchOrderStatuses:', e.message);
+  }
 }
 setInterval(watchOrderStatuses, 30000);
+
+// Диагностика уведомлений: состояние наблюдателя + тест отправки (?send=<chatId>)
+app.get('/tg/debug', async (req, res) => {
+  const out = {
+    baseline: orderWatchBaseline,
+    trackedOrders: orderStageSeen.size,
+    attrFound: !!_tgAttrMeta,
+    hasBotToken: !!process.env.TG_BOT_TOKEN,
+    lastWatch: _lastWatch
+  };
+  if (req.query.send) {
+    try {
+      const tr = await fetch('https://api.telegram.org/bot' + process.env.TG_BOT_TOKEN + '/sendMessage', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: req.query.send, text: '🔔 Тест Компас.Доставка — связь с ботом работает!' })
+      });
+      out.telegram = await tr.json(); // { ok:true } или { ok:false, description: "..." }
+    } catch(e) { out.testError = e.message; }
+  }
+  res.json(out);
+});
 
 
 // ── ВХОД СБОРЩИКОВ ПО PIN ──
