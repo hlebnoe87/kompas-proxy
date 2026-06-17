@@ -317,7 +317,7 @@ app.get('/tg/status/:sessionId', (req, res) => {
   const s = tgSessions.get(req.params.sessionId);
   if (!s) return res.json({ status: 'expired' });
   if (Date.now() > s.expires) { tgSessions.delete(req.params.sessionId); return res.json({ status: 'expired' }); }
-  res.json({ status: s.status, phone: s.phone });
+  res.json({ status: s.status, phone: s.phone, chatId: s.status === 'confirmed' ? (s.chatId || null) : null });
 });
 
 // 3. POLLING — прокси сам опрашивает Telegram (webhook не работает на Amvera)
@@ -398,6 +398,116 @@ async function tgSend(token, chatId, text, replyMarkup) {
     });
   } catch(e) { console.error('tgSend:', e.message); }
 }
+
+
+// ── TELEGRAM-УВЕДОМЛЕНИЯ О СТАТУСЕ ЗАКАЗА ──
+const MS_API = 'https://api.moysklad.ru/api/remap/1.2';
+function msAuthHeaders(json) {
+  const h = { 'Authorization': 'Bearer ' + process.env.MS_TOKEN };
+  if (json) h['Content-Type'] = 'application/json';
+  return h;
+}
+
+// meta доп.поля «Telegram chatId» у контрагента — ищем по имени, ID не хардкодим
+let _tgAttrMeta = null;
+async function getTgChatAttrMeta() {
+  if (_tgAttrMeta) return _tgAttrMeta;
+  try {
+    const r = await fetch(MS_API + '/entity/counterparty/metadata/attributes', { headers: msAuthHeaders() });
+    const data = await r.json();
+    const attr = (data.rows || []).find(a => a.name === 'Telegram chatId');
+    if (attr) _tgAttrMeta = attr.meta;
+    else console.warn('Доп.поле «Telegram chatId» не найдено в МоёмСкладе');
+  } catch(e) { console.error('getTgChatAttrMeta:', e.message); }
+  return _tgAttrMeta;
+}
+
+// Приложение вызывает после входа — сохраняем chatId в контрагента
+app.post('/tg/link', async (req, res) => {
+  try {
+    const clientId = req.body.clientId;
+    const chatId   = req.body.chatId;
+    if (!clientId || !chatId) return res.status(400).json({ error: 'clientId и chatId обязательны' });
+    const meta = await getTgChatAttrMeta();
+    if (!meta) return res.status(500).json({ error: 'attr_not_found' });
+    const r = await fetch(MS_API + '/entity/counterparty/' + clientId, {
+      method: 'PUT', headers: msAuthHeaders(true),
+      body: JSON.stringify({ attributes: [{ meta, value: String(chatId) }] })
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      console.warn('tg/link MS error', r.status, t.slice(0, 200));
+      return res.status(502).json({ error: 'moysklad_' + r.status });
+    }
+    console.log('TG link: client', clientId, '→ chat', chatId);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// chatId из контрагента (по его attributes)
+function chatIdFromAgent(agent) {
+  if (!agent || !agent.attributes) return null;
+  const a = agent.attributes.find(x => x.name === 'Telegram chatId');
+  return a && a.value ? String(a.value) : null;
+}
+async function getChatIdForOrder(o) {
+  let chatId = chatIdFromAgent(o.agent);          // из expand=agent
+  if (chatId) return chatId;
+  const href = o.agent && o.agent.meta && o.agent.meta.href;
+  if (!href) return null;
+  try {                                            // fallback — подтягиваем контрагента целиком
+    const r = await fetch(href, { headers: msAuthHeaders() });
+    return chatIdFromAgent(await r.json());
+  } catch(e) { return null; }
+}
+
+// Стадия по названию статуса — та же логика, что в приложении
+function stageFromStateName(name) {
+  const s = (name || '').toLowerCase();
+  if (s.includes('отмен')) return 0;
+  if (s.includes('возврат')) return 6;
+  if (s.includes('доставлен') || s.includes('выполнен') || s.includes('завершён')) return 4;
+  if (s.includes('пути') || s.includes('доставка') || s.includes('курьер')) return 3;
+  if (s.includes('сбор')) return 2;
+  if (s.includes('подтвердить оплату')) return 5;  // внутренняя стадия — не уведомляем
+  if (s.includes('принят') || s.includes('новый')) return 1;
+  return -1;
+}
+
+const ORDER_MSG = {
+  1: num => `✅ Ваш заказ ${num} принят! Мы скоро начнём его собирать.`,
+  2: num => `🛒 Заказ ${num} собирается на складе.`,
+  3: num => `🛵 Заказ ${num} передан курьеру и уже едет к вам! Ожидайте в течение часа.`,
+  4: num => `✓ Заказ ${num} доставлен. Спасибо, что выбрали Компас.Доставку! 💚`,
+  0: num => `❌ Заказ ${num} отменён. Если это ошибка — напишите нам.`,
+  6: num => `↩️ По заказу ${num} оформлен возврат.`,
+};
+
+// Следим за сменой статуса активных заказов и шлём уведомление в Telegram
+const orderStageSeen = new Map(); // orderId → последняя замеченная стадия
+let orderWatchBaseline = false;   // первый прогон — базовая линия (без рассылки)
+async function watchOrderStatuses() {
+  if (!process.env.TG_BOT_TOKEN || !process.env.MS_TOKEN) return;
+  try {
+    const r = await fetch(MS_API + '/entity/customerorder?limit=100&order=updated,desc&expand=state,agent', { headers: msAuthHeaders() });
+    const data = await r.json();
+    for (const o of (data.rows || [])) {
+      const stage = stageFromStateName(o.state && o.state.name);
+      const prev  = orderStageSeen.get(o.id);
+      orderStageSeen.set(o.id, stage);
+      if (!orderWatchBaseline) continue;                  // первый прогон — только запоминаем
+      if (prev === undefined || prev === stage) continue; // нет смены статуса
+      const make = ORDER_MSG[stage];
+      if (!make) continue;                                // эту стадию не уведомляем
+      const chatId = await getChatIdForOrder(o);
+      if (!chatId) continue;                              // у клиента нет привязанного Telegram
+      await tgSend(process.env.TG_BOT_TOKEN, chatId, make(o.name || ''));
+      console.log('TG notify:', o.name, '→ stage', stage, 'chat', chatId);
+    }
+    orderWatchBaseline = true;
+  } catch(e) { console.error('watchOrderStatuses:', e.message); }
+}
+setInterval(watchOrderStatuses, 30000);
 
 
 // ── ВХОД СБОРЩИКОВ ПО PIN ──
