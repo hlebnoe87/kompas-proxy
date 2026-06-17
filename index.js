@@ -5,6 +5,9 @@ const app     = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Health-check для Amvera: корень должен отдавать 200 (раньше был 404 → проба не проходила)
+app.get('/', (req, res) => res.json({ ok: true, service: 'kompas-proxy' }));
+
 // ── Безопасность: CORS только с разрешённых доменов ──
 const ALLOWED_ORIGINS = ['https://kompas87.ru', 'https://www.kompas87.ru'];
 app.use((req, res, next) => {
@@ -520,11 +523,15 @@ setInterval(watchOrderStatuses, 30000);
 
 // Диагностика уведомлений: состояние наблюдателя + тест отправки (?send=<chatId>)
 app.get('/tg/debug', async (req, res) => {
+  var sborka = getSborkaUsers();
   const out = {
     baseline: orderWatchBaseline,
     trackedOrders: orderStageSeen.size,
     attrFound: !!_tgAttrMeta,
     hasBotToken: !!process.env.TG_BOT_TOKEN,
+    sborkaUsersCount: Object.keys(sborka).length,        // сколько сборщиков загружено из SBORKA_USERS
+    sborkaPinLengths: Object.keys(sborka).map(p => p.length), // длины PIN (5 = кавычка попала в значение)
+    sborkaEnvSet: !!process.env.SBORKA_USERS,
     lastWatch: _lastWatch
   };
   if (req.query.send) {
