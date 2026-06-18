@@ -529,9 +529,9 @@ app.get('/tg/debug', async (req, res) => {
     trackedOrders: orderStageSeen.size,
     attrFound: !!_tgAttrMeta,
     hasBotToken: !!process.env.TG_BOT_TOKEN,
-    sborkaUsersCount: Object.keys(sborka).length,        // сколько сборщиков загружено из SBORKA_USERS
+    sborkaUsersCount: Object.keys(sborka).length,        // сколько сборщиков реально загружено
     sborkaPinLengths: Object.keys(sborka).map(p => p.length), // длины PIN (5 = кавычка попала в значение)
-    sborkaEnvSet: !!process.env.SBORKA_USERS,
+    sborkaEnvKeys: Object.keys(process.env).filter(k => k.toUpperCase().indexOf('SBORKA') === 0), // имена SBORKA*-переменных (без значений)
     lastWatch: _lastWatch
   };
   if (req.query.send) {
@@ -551,11 +551,17 @@ app.get('/tg/debug', async (req, res) => {
 // Сборщики хранятся в env SBORKA_USERS в формате: PIN:Имя,PIN:Имя
 // Пример: 1234:Иван Петров,5678:Мария Сидорова
 function getSborkaUsers() {
-  const raw = process.env.SBORKA_USERS || '';
   const users = {};
-  raw.split(',').forEach(pair => {
-    const [pin, ...nameParts] = pair.split(':');
-    if (pin && nameParts.length) users[pin.trim()] = nameParts.join(':').trim();
+  function addPair(raw) {
+    const [pin, ...nameParts] = (raw || '').split(':');
+    if (pin && pin.trim() && nameParts.length) users[pin.trim()] = nameParts.join(':').trim();
+  }
+  // Вариант 1: одна переменная SBORKA_USERS со списком через запятую (1234:Иван,5678:Мария)
+  (process.env.SBORKA_USERS || '').split(',').forEach(addPair);
+  // Вариант 2: отдельные переменные на каждого сборщика, БЕЗ запятых (удобно для Amvera):
+  //   SBORKA_USER1 = 1234:Иван Петров   |   SBORKA_USER2 = 5678:Мария Сидорова
+  Object.keys(process.env).forEach(function(key) {
+    if (key.indexOf('SBORKA_USER') === 0 && key !== 'SBORKA_USERS') addPair(process.env[key]);
   });
   return users;
 }
