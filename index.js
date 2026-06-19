@@ -253,6 +253,53 @@ app.post('/payment/capture', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// Отмена заказа: снять холд (reverse) или вернуть деньги (refund) + статус «Отменён»
+const CANCELLED_STATE = '6b95153d-02a8-11ed-0a80-073c00232c3e';
+app.post('/payment/cancel', async (req, res) => {
+  try {
+    const creds = alfaCredentials();
+    const msOrderId = req.body.msOrderId;
+    if (!msOrderId) return res.status(400).json({ error: 'msOrderId обязателен' });
+    // alfaOrderId из заказа
+    const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
+    const order = await oRes.json();
+    const attr = (order.attributes || []).find(a => a.name === 'Alfa orderId');
+    const alfaOrderId = attr && attr.value;
+    let payment = { action: 'none', reason: 'no_online_payment' };
+    if (alfaOrderId) {
+      const stParams = new URLSearchParams({ orderId: alfaOrderId, ...creds });
+      const stRes = await fetch('https://alfa.rbsuat.com/payment/rest/getOrderStatusExtended.do', {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: stParams.toString()
+      });
+      const st = await stRes.json();
+      const os = st.orderStatus ?? st.OrderStatus;
+      const amount = parseInt(st.amount ?? st.Amount ?? 0);
+      if (os === 1) {                                   // холд не списан → снимаем
+        const p = new URLSearchParams({ orderId: alfaOrderId, ...creds });
+        const r = await fetch('https://alfa.rbsuat.com/payment/rest/reverse.do', {
+          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: p.toString()
+        });
+        payment = { action: 'reverse', result: await r.json() };
+      } else if (os === 2) {                            // уже списан → полный возврат
+        const p = new URLSearchParams({ orderId: alfaOrderId, amount: String(amount), ...creds });
+        const r = await fetch('https://alfa.rbsuat.com/payment/rest/refund.do', {
+          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: p.toString()
+        });
+        payment = { action: 'refund', result: await r.json() };
+      } else {
+        payment = { action: 'none', orderStatus: os };
+      }
+    }
+    // статус «Отменён» в МоёмСкладе
+    const upd = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
+      method: 'PUT', headers: msAuthHeaders(true),
+      body: JSON.stringify({ state: { meta: { href: MS_API + '/entity/customerorder/metadata/states/' + CANCELLED_STATE, type: 'state', mediaType: 'application/json' } } })
+    });
+    console.log('CANCEL order', msOrderId, '→', payment.action, '| MS', upd.status);
+    res.json({ ok: upd.ok, payment });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Проксирование изображений МоегоСклада ──
 app.get('/miniature/*', async (req, res) => {
   const path  = req.path.replace('/miniature', '');
