@@ -19,7 +19,7 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
   }
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -297,6 +297,21 @@ app.post('/payment/cancel', async (req, res) => {
     });
     console.log('CANCEL order', msOrderId, '→', payment.action, '| MS', upd.status);
     res.json({ ok: upd.ok, payment });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Серверная смена статуса заказа (надёжнее прямого браузерного PUT)
+app.post('/order/set-state', async (req, res) => {
+  try {
+    const msOrderId = req.body.msOrderId, stateId = req.body.stateId;
+    if (!msOrderId || !stateId) return res.status(400).json({ error: 'msOrderId и stateId обязательны' });
+    const r = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
+      method: 'PUT', headers: msAuthHeaders(true),
+      body: JSON.stringify({ state: { meta: { href: MS_API + '/entity/customerorder/metadata/states/' + stateId, type: 'state', mediaType: 'application/json' } } })
+    });
+    if (!r.ok) { const t = await r.text(); console.warn('set-state MS', r.status, t.slice(0,150)); return res.status(502).json({ error: 'moysklad_' + r.status }); }
+    console.log('SET-STATE order', msOrderId, '→', stateId);
+    res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
