@@ -290,12 +290,18 @@ app.post('/payment/cancel', async (req, res) => {
         payment = { action: 'none', orderStatus: os };
       }
     }
-    // статус «Отменён» в МоёмСкладе
+    // статус «Отменён» + причина отмены в Комментарий заказа
+    const updBody = { state: { meta: { href: MS_API + '/entity/customerorder/metadata/states/' + CANCELLED_STATE, type: 'state', mediaType: 'application/json' } } };
+    const reason = (req.body.reason || '').toString().trim().slice(0, 500);
+    if (reason) {
+      const who = req.body.by ? (' (' + String(req.body.by).slice(0, 40) + ')') : '';
+      updBody.description = '❌ Причина отмены' + who + ': ' + reason + (order.description ? '\n\n' + order.description : '');
+    }
     const upd = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
       method: 'PUT', headers: msAuthHeaders(true),
-      body: JSON.stringify({ state: { meta: { href: MS_API + '/entity/customerorder/metadata/states/' + CANCELLED_STATE, type: 'state', mediaType: 'application/json' } } })
+      body: JSON.stringify(updBody)
     });
-    console.log('CANCEL order', msOrderId, '→', payment.action, '| MS', upd.status);
+    console.log('CANCEL order', msOrderId, '→', payment.action, '| MS', upd.status, '| reason:', reason || '—');
     res.json({ ok: upd.ok, payment });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -708,30 +714,30 @@ app.get('/tg/debug', async (req, res) => {
 // ── ВХОД СБОРЩИКОВ ПО PIN ──
 // Сборщики хранятся в env SBORKA_USERS в формате: PIN:Имя,PIN:Имя
 // Пример: 1234:Иван Петров,5678:Мария Сидорова
-function getSborkaUsers() {
+// Разбор пользователей из env: одна переменная со списком через запятую ИЛИ
+// отдельные переменные с префиксом (SBORKA_USER1, COURIER_USER1, ...). Формат PIN:Имя.
+function parseUsersFrom(singleEnv, prefix) {
   const users = {};
   function addPair(raw) {
     const [pin, ...nameParts] = (raw || '').split(':');
     if (pin && pin.trim() && nameParts.length) users[pin.trim()] = nameParts.join(':').trim();
   }
-  // Вариант 1: одна переменная SBORKA_USERS со списком через запятую (1234:Иван,5678:Мария)
-  (process.env.SBORKA_USERS || '').split(',').forEach(addPair);
-  // Вариант 2: отдельные переменные на каждого сборщика, БЕЗ запятых (удобно для Amvera):
-  //   SBORKA_USER1 = 1234:Иван Петров   |   SBORKA_USER2 = 5678:Мария Сидорова
+  (process.env[singleEnv] || '').split(',').forEach(addPair);
   Object.keys(process.env).forEach(function(key) {
-    if (key.indexOf('SBORKA_USER') === 0 && key !== 'SBORKA_USERS') addPair(process.env[key]);
+    if (key.indexOf(prefix) === 0 && key !== singleEnv) addPair(process.env[key]);
   });
   return users;
 }
+function getSborkaUsers()  { return parseUsersFrom('SBORKA_USERS',  'SBORKA_USER');  }
+function getCourierUsers() { return parseUsersFrom('COURIER_USERS', 'COURIER_USER'); }
 
 app.post('/sborka/login', (req, res) => {
   const pin = (req.body.pin || '').trim();
-  const users = getSborkaUsers();
-  if (users[pin]) {
-    res.json({ ok: true, name: users[pin], pin });
-  } else {
-    res.status(401).json({ error: 'Неверный PIN-код' });
-  }
+  const pickers = getSborkaUsers();
+  if (pickers[pin]) return res.json({ ok: true, name: pickers[pin], pin, role: 'picker' });
+  const couriers = getCourierUsers();
+  if (couriers[pin]) return res.json({ ok: true, name: couriers[pin], pin, role: 'courier' });
+  res.status(401).json({ error: 'Неверный PIN-код' });
 });
 
 const PORT = process.env.PORT || 3000;
