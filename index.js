@@ -237,9 +237,10 @@ app.post('/payment/capture', async (req, res) => {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: stParams.toString()
     });
     const st = await stRes.json();
-    if (st.orderStatus === 2) return res.json({ ok: true, already: true });   // уже списан (идемпотентность)
-    const amount = parseInt(st.amount || 0);
-    if (st.orderStatus !== 1 || !amount) return res.json({ ok: false, reason: 'not_held', status: st });
+    const os = st.orderStatus ?? st.OrderStatus;          // устойчиво к регистру поля
+    const amount = parseInt(st.amount ?? st.Amount ?? 0);
+    if (os === 2) return res.json({ ok: true, already: true });   // уже списан (идемпотентность)
+    if (os !== 1 || !amount) return res.json({ ok: false, reason: 'not_held', status: st });
     // 3. списываем полную удержанную сумму
     const depParams = new URLSearchParams({ orderId: alfaOrderId, amount: String(amount), ...creds });
     const depRes = await fetch('https://alfa.rbsuat.com/payment/rest/deposit.do', {
