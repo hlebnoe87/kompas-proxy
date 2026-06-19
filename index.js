@@ -116,6 +116,28 @@ app.post('/payment/register.do', async (req, res) => {
   }
 });
 
+// ── Альфа-Банк: ХОЛД (двухстадийная оплата — преавторизация) ──
+app.post('/payment/registerPreAuth.do', async (req, res) => {
+  try {
+    const creds = alfaCredentials();
+    const amount = parseInt(req.body.amount || 0);
+    if (!amount || amount < MIN_PAYMENT || amount > MAX_PAYMENT) {
+      console.warn('PREAUTH invalid amount:', amount);
+      return res.status(400).json({ error: 'Invalid amount' });
+    }
+    const params = new URLSearchParams({ ...req.body, ...creds });
+    console.log('PREAUTH register:', req.body.orderNumber, amount);
+    const response = await fetch('https://alfa.rbsuat.com/payment/rest/registerPreAuth.do', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString()
+    });
+    const data = await response.json();
+    console.log('PREAUTH result:', data.errorCode || 'OK');
+    res.json(data);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── Альфа-Банк: статус платежа ──
 app.post('/payment/getOrderStatus.do', async (req, res) => {
   try {
@@ -146,6 +168,88 @@ app.post('/payment/deposit.do', async (req, res) => {
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ── Альфа-Банк: ОТМЕНА ХОЛДА (заказ отменён до списания) ──
+app.post('/payment/reverse.do', async (req, res) => {
+  try {
+    const creds = alfaCredentials();
+    const params = new URLSearchParams({ ...req.body, ...creds });
+    console.log('REVERSE:', req.body.orderId);
+    const response = await fetch('https://alfa.rbsuat.com/payment/rest/reverse.do', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString()
+    });
+    const data = await response.json();
+    console.log('REVERSE result:', data.errorCode || 'OK');
+    res.json(data);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Двухстадийная оплата: сохранение alfaOrderId в заказ и списание холда ──
+// meta доп.поля «Alfa orderId» у заказа покупателя (ищем по имени)
+let _alfaAttrMeta = null;
+async function getAlfaAttrMeta() {
+  if (_alfaAttrMeta) return _alfaAttrMeta;
+  try {
+    const r = await fetch(MS_API + '/entity/customerorder/metadata/attributes', { headers: msAuthHeaders() });
+    const data = await r.json();
+    const attr = (data.rows || []).find(a => a.name === 'Alfa orderId');
+    if (attr) _alfaAttrMeta = attr.meta;
+    else console.warn('Доп.поле «Alfa orderId» не найдено у заказа покупателя');
+  } catch(e) { console.error('getAlfaAttrMeta:', e.message); }
+  return _alfaAttrMeta;
+}
+
+// Приложение клиента вызывает после оплаты — сохраняем alfaOrderId в заказ
+app.post('/payment/save-order-id', async (req, res) => {
+  try {
+    const msOrderId = req.body.msOrderId, alfaOrderId = req.body.alfaOrderId;
+    if (!msOrderId || !alfaOrderId) return res.status(400).json({ error: 'msOrderId и alfaOrderId обязательны' });
+    const meta = await getAlfaAttrMeta();
+    if (!meta) return res.status(500).json({ error: 'attr_not_found' });
+    const r = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
+      method: 'PUT', headers: msAuthHeaders(true),
+      body: JSON.stringify({ attributes: [{ meta, value: String(alfaOrderId) }] })
+    });
+    if (!r.ok) { const t = await r.text(); console.warn('save-order-id MS', r.status, t.slice(0,150)); return res.status(502).json({ error: 'moysklad_' + r.status }); }
+    console.log('Saved alfaOrderId', alfaOrderId, '→ order', msOrderId);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Приложение сборщика вызывает на «Заказ собран» — списываем удержанную сумму
+app.post('/payment/capture', async (req, res) => {
+  try {
+    const creds = alfaCredentials();
+    const msOrderId = req.body.msOrderId;
+    if (!msOrderId) return res.status(400).json({ error: 'msOrderId обязателен' });
+    // 1. находим alfaOrderId в заказе
+    const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
+    const order = await oRes.json();
+    const attr = (order.attributes || []).find(a => a.name === 'Alfa orderId');
+    const alfaOrderId = attr && attr.value;
+    if (!alfaOrderId) return res.json({ ok: false, reason: 'no_online_payment' }); // наличные — нечего списывать
+    // 2. узнаём удержанную сумму и статус
+    const stParams = new URLSearchParams({ orderId: alfaOrderId, ...creds });
+    const stRes = await fetch('https://alfa.rbsuat.com/payment/rest/getOrderStatusExtended.do', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: stParams.toString()
+    });
+    const st = await stRes.json();
+    if (st.orderStatus === 2) return res.json({ ok: true, already: true });   // уже списан (идемпотентность)
+    const amount = parseInt(st.amount || 0);
+    if (st.orderStatus !== 1 || !amount) return res.json({ ok: false, reason: 'not_held', status: st });
+    // 3. списываем полную удержанную сумму
+    const depParams = new URLSearchParams({ orderId: alfaOrderId, amount: String(amount), ...creds });
+    const depRes = await fetch('https://alfa.rbsuat.com/payment/rest/deposit.do', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: depParams.toString()
+    });
+    const dep = await depRes.json();
+    const okDep = !dep.errorCode || dep.errorCode === '0';
+    console.log('CAPTURE order', msOrderId, 'amount', amount, okDep ? 'OK' : dep.errorMessage);
+    res.json({ ok: okDep, amount, deposit: dep });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Проксирование изображений МоегоСклада ──
@@ -534,15 +638,6 @@ app.get('/tg/debug', async (req, res) => {
     sborkaEnvKeys: Object.keys(process.env).filter(k => k.toUpperCase().indexOf('SBORKA') === 0), // имена SBORKA*-переменных (без значений)
     lastWatch: _lastWatch
   };
-  if (req.query.send) {
-    try {
-      const tr = await fetch('https://api.telegram.org/bot' + process.env.TG_BOT_TOKEN + '/sendMessage', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: req.query.send, text: '🔔 Тест Компас.Доставка — связь с ботом работает!' })
-      });
-      out.telegram = await tr.json(); // { ok:true } или { ok:false, description: "..." }
-    } catch(e) { out.testError = e.message; }
-  }
   res.json(out);
 });
 
