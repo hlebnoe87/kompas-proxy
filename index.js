@@ -321,6 +321,34 @@ app.post('/order/set-state', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// Курьер принимает заказ: пишем его имя+телефон в Комментарий + шлём клиенту «В пути» в Telegram
+app.post('/order/accept', async (req, res) => {
+  try {
+    const msOrderId = req.body.msOrderId;
+    const courierName  = (req.body.courierName  || '').toString().trim().slice(0, 80);
+    const courierPhone = (req.body.courierPhone || '').toString().trim().slice(0, 30);
+    if (!msOrderId || !courierName || !courierPhone) return res.status(400).json({ error: 'msOrderId, courierName, courierPhone обязательны' });
+    const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId + '?expand=agent', { headers: msAuthHeaders() });
+    const order = await oRes.json();
+    // дописываем курьера в комментарий (прежнюю строку курьера, если была, заменяем)
+    const baseDesc = (order.description || '').replace(/^🛵 Курьер:.*(\r?\n)?/m, '').trim();
+    const newDesc = '🛵 Курьер: ' + courierName + ' | ' + courierPhone + (baseDesc ? '\n\n' + baseDesc : '');
+    const upd = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
+      method: 'PUT', headers: msAuthHeaders(true),
+      body: JSON.stringify({ description: newDesc })
+    });
+    if (!upd.ok) { const t = await upd.text(); console.warn('accept MS', upd.status, t.slice(0,150)); return res.status(502).json({ error: 'moysklad_' + upd.status }); }
+    // Telegram клиенту: «В пути» с контактами курьера
+    const chatId = await getChatIdForOrder(order);
+    if (chatId && process.env.TG_BOT_TOKEN) {
+      await tgSend(process.env.TG_BOT_TOKEN, chatId,
+        '🛵 Заказ ' + (order.name || '') + ' уже в пути!\nКурьер: ' + courierName + '\nТелефон: ' + courierPhone);
+    }
+    console.log('ACCEPT order', msOrderId, 'courier', courierName);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Проксирование изображений МоегоСклада ──
 app.get('/miniature/*', async (req, res) => {
   const path  = req.path.replace('/miniature', '');
@@ -653,7 +681,7 @@ function stageFromStateName(name) {
 const ORDER_MSG = {
   1: num => `✅ Ваш заказ ${num} принят! Мы скоро начнём его собирать.`,
   2: num => `🛒 Заказ ${num} собирается на складе.`,
-  3: num => `🛵 Заказ ${num} передан курьеру и уже едет к вам! Ожидайте в течение часа.`,
+  // 3 (В пути) НЕ шлём из наблюдателя — уведомление с контактами курьера уходит при принятии заказа (/order/accept)
   4: num => `✓ Заказ ${num} доставлен. Спасибо, что выбрали Компас.Доставку! 💚`,
   0: num => `❌ Заказ ${num} отменён. Если это ошибка — напишите нам.`,
   6: num => `↩️ По заказу ${num} оформлен возврат.`,
