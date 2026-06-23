@@ -549,6 +549,24 @@ async function tgHandleUpdate(update, TG_TOKEN) {
     const msg = update.message;
     if (!msg) return;
     const chatId = msg.chat && msg.chat.id;
+    const SUPPORT_CHAT_ID = process.env.SUPPORT_CHAT_ID;
+
+    // Служебная команда: узнать chat_id текущего чата (для настройки группы поддержки)
+    if (msg.text && msg.text.trim() === '/chatid') {
+      await tgSend(TG_TOKEN, chatId, 'chat_id этого чата: ' + chatId);
+      return;
+    }
+
+    // Ответ оператора из группы поддержки → пересылаем клиенту
+    if (SUPPORT_CHAT_ID && String(chatId) === String(SUPPORT_CHAT_ID) && msg.reply_to_message) {
+      const quoted = msg.reply_to_message.text || '';
+      const m = quoted.match(/#from:(\d+)/);
+      if (m && msg.text) {
+        await tgSend(TG_TOKEN, m[1], '💬 Поддержка Компас:\n\n' + msg.text);
+        await tgSend(TG_TOKEN, chatId, '✅ Отправлено клиенту');
+      }
+      return;
+    }
 
     if (msg.text && msg.text.startsWith('/start')) {
       const parts = msg.text.split(' ');
@@ -583,6 +601,20 @@ async function tgHandleUpdate(update, TG_TOKEN) {
           '❌ Номер не совпадает с тем, что вы ввели в приложении.\n\nВы ввели: +' + matched.s.phone +
           '\nВ Telegram: +' + tgPhone + '\n\nПроверьте номер в приложении.', { remove_keyboard: true });
       }
+      return;
+    }
+
+    // Обычное текстовое сообщение в личке боту = обращение в поддержку
+    if (msg.text && msg.chat && msg.chat.type === 'private') {
+      if (!SUPPORT_CHAT_ID) return;          // группа поддержки не настроена
+      const u = msg.from || {};
+      const who = ([u.first_name, u.last_name].filter(Boolean).join(' ') || 'Клиент') +
+        (u.username ? ' (@' + u.username + ')' : '');
+      await tgSend(TG_TOKEN, SUPPORT_CHAT_ID,
+        '📨 Обращение в поддержку\nОт: ' + who + '\n\n' + msg.text +
+        '\n\n↩️ Ответьте на это сообщение, чтобы написать клиенту\n#from:' + chatId);
+      await tgSend(TG_TOKEN, chatId, '✅ Ваше сообщение получено, оператор скоро ответит.');
+      return;
     }
   } catch(e) {
     console.error('TG update error:', e.message);
