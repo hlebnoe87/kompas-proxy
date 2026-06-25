@@ -595,7 +595,8 @@ async function tgHandleUpdate(update, TG_TOKEN) {
       if (tgPhone.slice(-10) === matched.s.phone.slice(-10)) {
         matched.s.status = 'confirmed';
         matched.s.tgPhone = tgPhone;
-        await tgSend(TG_TOKEN, chatId, '✅ Номер подтверждён! Вернитесь в приложение — вход выполнен.', { remove_keyboard: true });
+        await tgSend(TG_TOKEN, chatId, '✅ Номер подтверждён! Вход выполнен.\n\nНажмите кнопку ниже, чтобы вернуться в приложение 👇',
+          { inline_keyboard: [[{ text: '⬅️ Назад в приложение', url: 'https://kompas87.ru/' }]] });
       } else {
         await tgSend(TG_TOKEN, chatId,
           '❌ Номер не совпадает с тем, что вы ввели в приложении.\n\nВы ввели: +' + matched.s.phone +
