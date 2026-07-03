@@ -69,6 +69,11 @@ function alfaCredentials() {
   return { userName: user, password: pass };
 }
 
+// Среда Альфа-Банка: без ALFA_API_BASE — тестовая (rbsuat), боевая задаётся в env Amvera:
+// ALFA_API_BASE=https://payment.alfabank.ru/payment/rest (+ боевые ALFA_USER/ALFA_PASS)
+const ALFA_API = (process.env.ALFA_API_BASE || 'https://alfa.rbsuat.com/payment/rest').replace(/\/+$/, '');
+console.log('Alfa API среда:', ALFA_API.includes('rbsuat') ? 'ТЕСТОВАЯ (' + ALFA_API + ')' : 'БОЕВАЯ (' + ALFA_API + ')');
+
 // ── МойСклад API ──
 const ALLOWED_MS_PATHS = [
   '/entity/assortment',
@@ -127,7 +132,7 @@ app.post('/payment/register.do', async (req, res) => {
     }
     const params = new URLSearchParams({ ...req.body, ...creds });
     console.log('PAYMENT register:', req.body.orderNumber, amount);
-    const response = await fetch('https://alfa.rbsuat.com/payment/rest/register.do', {
+    const response = await fetch(ALFA_API + '/register.do', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString()
     });
     const data = await response.json();
@@ -149,7 +154,7 @@ app.post('/payment/registerPreAuth.do', async (req, res) => {
     }
     const params = new URLSearchParams({ ...req.body, ...creds });
     console.log('PREAUTH register:', req.body.orderNumber, amount);
-    const response = await fetch('https://alfa.rbsuat.com/payment/rest/registerPreAuth.do', {
+    const response = await fetch(ALFA_API + '/registerPreAuth.do', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString()
     });
     const data = await response.json();
@@ -165,7 +170,7 @@ app.post('/payment/getOrderStatus.do', async (req, res) => {
   try {
     const creds = alfaCredentials();
     const params = new URLSearchParams({ ...req.body, ...creds });
-    const response = await fetch('https://alfa.rbsuat.com/payment/rest/getOrderStatus.do', {
+    const response = await fetch(ALFA_API + '/getOrderStatus.do', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString()
     });
     const data = await response.json();
@@ -181,7 +186,7 @@ app.post('/payment/deposit.do', async (req, res) => {
     const creds = alfaCredentials();
     const params = new URLSearchParams({ ...req.body, ...creds });
     console.log('DEPOSIT:', req.body.orderId);
-    const response = await fetch('https://alfa.rbsuat.com/payment/rest/deposit.do', {
+    const response = await fetch(ALFA_API + '/deposit.do', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString()
     });
     const data = await response.json();
@@ -198,7 +203,7 @@ app.post('/payment/reverse.do', async (req, res) => {
     const creds = alfaCredentials();
     const params = new URLSearchParams({ ...req.body, ...creds });
     console.log('REVERSE:', req.body.orderId);
-    const response = await fetch('https://alfa.rbsuat.com/payment/rest/reverse.do', {
+    const response = await fetch(ALFA_API + '/reverse.do', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString()
     });
     const data = await response.json();
@@ -247,15 +252,15 @@ app.post('/payment/capture', async (req, res) => {
     const creds = alfaCredentials();
     const msOrderId = req.body.msOrderId;
     if (!msOrderId) return res.status(400).json({ error: 'msOrderId обязателен' });
-    // 1. находим alfaOrderId в заказе
-    const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
+    // 1. находим alfaOrderId в заказе (+ отгрузки для расчёта фактической суммы)
+    const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId + '?expand=demands', { headers: msAuthHeaders() });
     const order = await oRes.json();
     const attr = (order.attributes || []).find(a => a.name === 'Alfa orderId');
     const alfaOrderId = attr && attr.value;
     if (!alfaOrderId) return res.json({ ok: false, reason: 'no_online_payment' }); // наличные — нечего списывать
     // 2. узнаём удержанную сумму и статус
     const stParams = new URLSearchParams({ orderId: alfaOrderId, ...creds });
-    const stRes = await fetch('https://alfa.rbsuat.com/payment/rest/getOrderStatusExtended.do', {
+    const stRes = await fetch(ALFA_API + '/getOrderStatusExtended.do', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: stParams.toString()
     });
     const st = await stRes.json();
@@ -263,15 +268,35 @@ app.post('/payment/capture', async (req, res) => {
     const amount = parseInt(st.amount ?? st.Amount ?? 0);
     if (os === 2) return res.json({ ok: true, already: true });   // уже списан (идемпотентность)
     if (os !== 1 || !amount) return res.json({ ok: false, reason: 'not_held', status: st });
-    // 3. списываем полную удержанную сумму
-    const depParams = new URLSearchParams({ orderId: alfaOrderId, amount: String(amount), ...creds });
-    const depRes = await fetch('https://alfa.rbsuat.com/payment/rest/deposit.do', {
+    // 3. фактическая сумма списания: холд = товары − бонусы + доставка; если при сборке
+    //    товары заменили/убрали, отгрузка дешевле заказа — уменьшаем списание на разницу,
+    //    остаток холда банк разблокирует автоматически (частичный deposit)
+    let captureAmount = amount;
+    try {
+      const demands = order.demands || [];
+      // demands могли прийти meta-ссылками без sum — дозагружаем
+      for (const d of demands) {
+        if (typeof d.sum !== 'number' && d.meta && d.meta.href) {
+          const dr = await fetch(d.meta.href, { headers: msAuthHeaders() });
+          if (dr.ok) { const dd = await dr.json(); if (typeof dd.sum === 'number') d.sum = dd.sum; }
+        }
+      }
+      const demandSum = demands.reduce((s, d) => s + (typeof d.sum === 'number' ? d.sum : 0), 0);
+      const orderSum = order.sum || 0;
+      if (demandSum > 0 && orderSum > 0 && demandSum < orderSum) {
+        const shortfall = orderSum - demandSum; // копейки
+        captureAmount = Math.max(MIN_PAYMENT, Math.min(amount, amount - shortfall));
+        console.log('CAPTURE частичное: заказ', orderSum, 'отгружено', demandSum, 'холд', amount, '→ списание', captureAmount);
+      }
+    } catch(e) { console.warn('CAPTURE: не удалось уточнить сумму отгрузки —', e.message, '— списываем полный холд'); }
+    const depParams = new URLSearchParams({ orderId: alfaOrderId, amount: String(captureAmount), ...creds });
+    const depRes = await fetch(ALFA_API + '/deposit.do', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: depParams.toString()
     });
     const dep = await depRes.json();
     const okDep = !dep.errorCode || dep.errorCode === '0';
-    console.log('CAPTURE order', msOrderId, 'amount', amount, okDep ? 'OK' : dep.errorMessage);
-    res.json({ ok: okDep, amount, deposit: dep });
+    console.log('CAPTURE order', msOrderId, 'amount', captureAmount, 'of', amount, okDep ? 'OK' : dep.errorMessage);
+    res.json({ ok: okDep, amount: captureAmount, held: amount, deposit: dep });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -290,7 +315,7 @@ app.post('/payment/cancel', async (req, res) => {
     let payment = { action: 'none', reason: 'no_online_payment' };
     if (alfaOrderId) {
       const stParams = new URLSearchParams({ orderId: alfaOrderId, ...creds });
-      const stRes = await fetch('https://alfa.rbsuat.com/payment/rest/getOrderStatusExtended.do', {
+      const stRes = await fetch(ALFA_API + '/getOrderStatusExtended.do', {
         method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: stParams.toString()
       });
       const st = await stRes.json();
@@ -298,13 +323,13 @@ app.post('/payment/cancel', async (req, res) => {
       const amount = parseInt(st.amount ?? st.Amount ?? 0);
       if (os === 1) {                                   // холд не списан → снимаем
         const p = new URLSearchParams({ orderId: alfaOrderId, ...creds });
-        const r = await fetch('https://alfa.rbsuat.com/payment/rest/reverse.do', {
+        const r = await fetch(ALFA_API + '/reverse.do', {
           method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: p.toString()
         });
         payment = { action: 'reverse', result: await r.json() };
       } else if (os === 2) {                            // уже списан → полный возврат
         const p = new URLSearchParams({ orderId: alfaOrderId, amount: String(amount), ...creds });
-        const r = await fetch('https://alfa.rbsuat.com/payment/rest/refund.do', {
+        const r = await fetch(ALFA_API + '/refund.do', {
           method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: p.toString()
         });
         payment = { action: 'refund', result: await r.json() };
