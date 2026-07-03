@@ -124,6 +124,33 @@ app.all('/proxy/*', async (req, res) => {
   }
 });
 
+// Диагностика конфигурации Альфы (без секретов — только наличие и длины).
+// Защищено кодом замка: /payment/env-check?pin=<APP_LOCK_PIN>
+app.get('/payment/env-check', (req, res) => {
+  const gate = process.env.APP_LOCK_PIN;
+  if (!gate || String(req.query.pin || '') !== String(gate)) return res.status(403).json({ error: 'forbidden' });
+  let b64ok = null, passSrc = 'none', passLen = 0;
+  if (process.env.ALFA_PASS_B64) {
+    try {
+      const decoded = Buffer.from(process.env.ALFA_PASS_B64, 'base64').toString('utf8').trim();
+      b64ok = decoded.length > 0;
+      passSrc = 'ALFA_PASS_B64';
+      passLen = decoded.length;
+    } catch(e) { b64ok = false; }
+  } else if (process.env.ALFA_PASS) {
+    passSrc = 'ALFA_PASS';
+    passLen = process.env.ALFA_PASS.length;
+  }
+  res.json({
+    alfaApi:  ALFA_API,
+    userSet:  !!process.env.ALFA_USER,
+    userLen:  (process.env.ALFA_USER || '').length,
+    passSrc:  passSrc,   // какая переменная используется для пароля
+    passLen:  passLen,   // длина пароля после декодирования/как есть
+    b64ok:    b64ok      // true = ALFA_PASS_B64 декодировалась без ошибок
+  });
+});
+
 // ── Альфа-Банк: регистрация платежа ──
 app.post('/payment/register.do', async (req, res) => {
   try {
