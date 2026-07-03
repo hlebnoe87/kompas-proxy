@@ -61,10 +61,14 @@ app.post('/app-lock/check', (req, res) => {
   res.json({ ok });
 });
 
-// Credentials только из переменных окружения — не из кода
+// Credentials только из переменных окружения — не из кода.
+// Если пароль содержит символы, которые панель не принимает (например «!»),
+// задайте ALFA_PASS_B64 = пароль в base64 — он имеет приоритет над ALFA_PASS.
 function alfaCredentials() {
   const user = process.env.ALFA_USER;
-  const pass = process.env.ALFA_PASS;
+  const pass = process.env.ALFA_PASS_B64
+    ? Buffer.from(process.env.ALFA_PASS_B64, 'base64').toString('utf8').trim()
+    : process.env.ALFA_PASS;
   if (!user || !pass) throw new Error('Alfa-Bank credentials not configured');
   return { userName: user, password: pass };
 }
