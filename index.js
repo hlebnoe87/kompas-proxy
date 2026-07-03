@@ -39,6 +39,28 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── Временный код-замок приложения (на время тестирования эквайринга) ──
+// Задайте APP_LOCK_PIN (6 цифр) в переменных окружения Amvera — приложение попросит код при входе.
+// Уберите переменную и перезапустите сервис — замок исчезнет, менять код приложения не нужно.
+const lockAttempts = new Map(); // ip → { n: попыток, t: начало окна }
+app.get('/app-lock/status', (req, res) => {
+  res.json({ locked: !!process.env.APP_LOCK_PIN });
+});
+app.post('/app-lock/check', (req, res) => {
+  const pin = process.env.APP_LOCK_PIN;
+  if (!pin) return res.json({ ok: true, locked: false });
+  const ip = req.ip || req.connection.remoteAddress || '';
+  const now = Date.now();
+  const a = lockAttempts.get(ip) || { n: 0, t: now };
+  if (now - a.t > 15 * 60000) { a.n = 0; a.t = now; }
+  if (a.n >= 10) return res.status(429).json({ ok: false, error: 'too_many_attempts' });
+  const ok = String((req.body && req.body.pin) || '') === String(pin);
+  a.n = ok ? 0 : a.n + 1;
+  lockAttempts.set(ip, a);
+  if (!ok) console.warn('APP-LOCK: неверный код с', ip, '(попытка ' + a.n + '/10)');
+  res.json({ ok });
+});
+
 // Credentials только из переменных окружения — не из кода
 function alfaCredentials() {
   const user = process.env.ALFA_USER;
