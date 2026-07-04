@@ -61,6 +61,39 @@ app.post('/app-lock/check', (req, res) => {
   res.json({ ok });
 });
 
+// ── Серверная блокировка заказов между сборщиками ──
+// Заказ одновременно собирает только один ТСД. Хранится в памяти: перезапуск сервиса
+// сбрасывает блокировки, TTL 2 часа страхует от «зависших» (ТСД разрядился и т.п.).
+const SBORKA_LOCK_TTL = 2 * 3600 * 1000;
+const sborkaLocks = new Map(); // orderId → { name, t }
+function cleanSborkaLocks() {
+  const cutoff = Date.now() - SBORKA_LOCK_TTL;
+  for (const [id, l] of sborkaLocks) if (!l || !l.t || l.t < cutoff) sborkaLocks.delete(id);
+}
+app.post('/sborka/lock', (req, res) => {
+  cleanSborkaLocks();
+  const orderId = String(req.body.orderId || '');
+  const name = String(req.body.picker || '').slice(0, 60);
+  if (!orderId || !name) return res.status(400).json({ error: 'orderId и picker обязательны' });
+  const cur = sborkaLocks.get(orderId);
+  if (cur && cur.name !== name) return res.json({ ok: false, by: cur.name, since: cur.t });
+  sborkaLocks.set(orderId, { name, t: Date.now() });
+  res.json({ ok: true });
+});
+app.post('/sborka/unlock', (req, res) => {
+  const orderId = String(req.body.orderId || '');
+  const name = String(req.body.picker || '');
+  const cur = sborkaLocks.get(orderId);
+  if (cur && cur.name === name) sborkaLocks.delete(orderId);
+  res.json({ ok: true });
+});
+app.get('/sborka/locks', (req, res) => {
+  cleanSborkaLocks();
+  const out = {};
+  for (const [id, l] of sborkaLocks) out[id] = { name: l.name, t: l.t };
+  res.json(out);
+});
+
 // Credentials только из переменных окружения — не из кода.
 // Если пароль содержит символы, которые панель не принимает (например «!»),
 // задайте ALFA_PASS_B64 = пароль в base64 — он имеет приоритет над ALFA_PASS.
