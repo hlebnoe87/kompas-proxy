@@ -94,6 +94,90 @@ app.get('/sborka/locks', (req, res) => {
   res.json(out);
 });
 
+// ── WEB PUSH УВЕДОМЛЕНИЯ ──
+// Требует: пакет web-push в package.json + env VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY
+// (сгенерировать: npx web-push generate-vapid-keys). Подписки живут в /data — переживают рестарты.
+let webpush = null;
+try { webpush = require('web-push'); } catch(e) { console.warn('Пакет web-push не установлен — пуш-уведомления отключены'); }
+const fs = require('fs');
+const PUSH_STORE = process.env.PUSH_STORE || (fs.existsSync('/data') ? '/data/push-subs.json' : './push-subs.json');
+let pushSubs = {}; // clientId (контрагент МС) → [{ sub, t }]
+try { pushSubs = JSON.parse(fs.readFileSync(PUSH_STORE, 'utf8')) || {}; } catch(e) {}
+function savePushSubs() {
+  try { fs.writeFileSync(PUSH_STORE, JSON.stringify(pushSubs)); } catch(e) { console.warn('push store:', e.message); }
+}
+function pushEnabled() {
+  return !!(webpush && process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
+}
+if (pushEnabled()) {
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT || 'mailto:info@kompas87.ru',
+    process.env.VAPID_PUBLIC_KEY, process.env.VAPID_PRIVATE_KEY
+  );
+  console.log('Web Push: включён,', Object.keys(pushSubs).length, 'клиентов с подписками');
+} else {
+  console.log('Web Push: выключен (нужны пакет web-push и VAPID-ключи в env)');
+}
+
+app.get('/push/vapid-public-key', (req, res) => {
+  res.json({ key: pushEnabled() ? process.env.VAPID_PUBLIC_KEY : null });
+});
+
+app.post('/push/subscribe', (req, res) => {
+  try {
+    const clientId = String(req.body.clientId || '').slice(0, 64);
+    const sub = req.body.subscription;
+    if (!clientId || !sub || typeof sub.endpoint !== 'string' || !sub.endpoint.startsWith('https://')) {
+      return res.status(400).json({ error: 'clientId и subscription обязательны' });
+    }
+    const list = (pushSubs[clientId] || []).filter(s => s.sub.endpoint !== sub.endpoint);
+    list.push({ sub, t: Date.now() });
+    pushSubs[clientId] = list.slice(-5); // максимум 5 устройств на клиента
+    savePushSubs();
+    console.log('PUSH subscribe:', clientId, 'устройств:', pushSubs[clientId].length);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/push/unsubscribe', (req, res) => {
+  const endpoint = req.body && req.body.endpoint;
+  if (endpoint) {
+    let changed = false;
+    for (const cid of Object.keys(pushSubs)) {
+      const filtered = pushSubs[cid].filter(s => s.sub.endpoint !== endpoint);
+      if (filtered.length !== pushSubs[cid].length) changed = true;
+      if (filtered.length) pushSubs[cid] = filtered; else delete pushSubs[cid];
+    }
+    if (changed) savePushSubs();
+  }
+  res.json({ ok: true });
+});
+
+// Отправка пуша на все устройства клиента; умершие подписки (404/410) вычищаются
+async function sendPushToClient(clientId, title, body) {
+  if (!pushEnabled() || !clientId) return 0;
+  const list = pushSubs[clientId] || [];
+  let sent = 0, changed = false;
+  for (const item of list.slice()) {
+    try {
+      await webpush.sendNotification(item.sub, JSON.stringify({ title, body, url: '/' }), { TTL: 3600 });
+      sent++;
+    } catch(e) {
+      if (e.statusCode === 404 || e.statusCode === 410) {
+        pushSubs[clientId] = (pushSubs[clientId] || []).filter(s => s.sub.endpoint !== item.sub.endpoint);
+        if (!pushSubs[clientId].length) delete pushSubs[clientId];
+        changed = true;
+      } else console.warn('push send:', e.statusCode || e.message);
+    }
+  }
+  if (changed) savePushSubs();
+  return sent;
+}
+function agentIdFromOrder(o) {
+  const href = (o.agent && o.agent.meta && o.agent.meta.href) || '';
+  return href.split('/').pop().split('?')[0] || null;
+}
+
 // Credentials только из переменных окружения — не из кода.
 // Если пароль содержит символы, которые панель не принимает (например «!»),
 // задайте ALFA_PASS_B64 = пароль в base64 — он имеет приоритет над ALFA_PASS.
@@ -449,12 +533,13 @@ app.post('/order/accept', async (req, res) => {
       body: JSON.stringify({ description: newDesc })
     });
     if (!upd.ok) { const t = await upd.text(); console.warn('accept MS', upd.status, t.slice(0,150)); return res.status(502).json({ error: 'moysklad_' + upd.status }); }
-    // Telegram клиенту: «В пути» с контактами курьера
+    // Уведомление клиенту «В пути» с контактами курьера: Telegram + web push
+    const inTransitMsg = '🛵 Заказ ' + (order.name || '') + ' уже в пути!\nКурьер: ' + courierName + '\nТелефон: ' + courierPhone;
     const chatId = await getChatIdForOrder(order);
     if (chatId && process.env.TG_BOT_TOKEN) {
-      await tgSend(process.env.TG_BOT_TOKEN, chatId,
-        '🛵 Заказ ' + (order.name || '') + ' уже в пути!\nКурьер: ' + courierName + '\nТелефон: ' + courierPhone);
+      await tgSend(process.env.TG_BOT_TOKEN, chatId, inTransitMsg);
     }
+    sendPushToClient(agentIdFromOrder(order), 'Компас.Доставка', inTransitMsg).catch(() => {});
     console.log('ACCEPT order', msOrderId, 'courier', courierName);
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -835,7 +920,8 @@ const orderStageSeen = new Map(); // orderId → последняя замече
 let orderWatchBaseline = false;   // первый прогон — базовая линия (без рассылки)
 let _lastWatch = { at: null, rows: 0, changed: 0, sent: 0, error: null };
 async function watchOrderStatuses() {
-  if (!process.env.TG_BOT_TOKEN || !process.env.MS_TOKEN) return;
+  if (!process.env.MS_TOKEN) return;
+  if (!process.env.TG_BOT_TOKEN && !pushEnabled()) return; // ни одного канала уведомлений
   try {
     const r = await fetch(MS_API + '/entity/customerorder?limit=100&order=updated,desc&expand=state,agent', { headers: msAuthHeaders() });
     const data = await r.json();
@@ -850,11 +936,17 @@ async function watchOrderStatuses() {
       changed++;
       const make = ORDER_MSG[stage];
       if (!make) continue;                                // эту стадию не уведомляем
-      const chatId = await getChatIdForOrder(o);
-      if (!chatId) continue;                              // у клиента нет привязанного Telegram
-      await tgSend(process.env.TG_BOT_TOKEN, chatId, make(o.name || ''));
-      sent++;
-      console.log('TG notify:', o.name, '→ stage', stage, 'chat', chatId);
+      const text = make(o.name || '');
+      if (process.env.TG_BOT_TOKEN) {
+        const chatId = await getChatIdForOrder(o);
+        if (chatId) {
+          await tgSend(process.env.TG_BOT_TOKEN, chatId, text);
+          sent++;
+          console.log('TG notify:', o.name, '→ stage', stage, 'chat', chatId);
+        }
+      }
+      const pushed = await sendPushToClient(agentIdFromOrder(o), 'Компас.Доставка', text);
+      if (pushed) { sent += pushed; console.log('PUSH notify:', o.name, '→ stage', stage, '×' + pushed); }
     }
     orderWatchBaseline = true;
     _lastWatch = { at: new Date().toISOString(), rows: rows.length, changed, sent, error: rows.length ? null : 'no rows' };
