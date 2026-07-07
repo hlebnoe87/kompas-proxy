@@ -264,7 +264,17 @@ app.get('/payment/env-check', (req, res) => {
     userLen:  (process.env.ALFA_USER || '').length,
     passSrc:  passSrc,   // какая переменная используется для пароля
     passLen:  passLen,   // длина пароля после декодирования/как есть
-    b64ok:    b64ok      // true = ALFA_PASS_B64 декодировалась без ошибок
+    b64ok:    b64ok,     // true = ALFA_PASS_B64 декодировалась без ошибок
+    push: {
+      module:    !!webpush,                          // false = пакет web-push не установился (package.json?)
+      vapidPub:  !!process.env.VAPID_PUBLIC_KEY,
+      vapidPriv: !!process.env.VAPID_PRIVATE_KEY,
+      pubLen:    (process.env.VAPID_PUBLIC_KEY || '').length,   // должно быть 87
+      privLen:   (process.env.VAPID_PRIVATE_KEY || '').length,  // должно быть 43
+      enabled:   pushEnabled(),
+      clients:   Object.keys(pushSubs).length,
+      store:     PUSH_STORE
+    }
   });
 });
 
@@ -956,6 +966,64 @@ async function watchOrderStatuses() {
   }
 }
 setInterval(watchOrderStatuses, 30000);
+
+// ── СТОРОЖ БРОШЕННЫХ ОПЛАТ ──
+// Заказ создаётся в МС до оплаты (иначе при сбое возврата из банка были бы «деньги без заказа»).
+// Если клиент ушёл со страницы оплаты и не вернулся, приложение его не отменит — делаем это здесь:
+// «Новый» + «Картой онлайн» → оплачен у банка = ставим «Оплачен онлайн»; не оплачен за 25 мин = отменяем.
+const ST_NEW        = '6b950fea-02a8-11ed-0a80-073c00232c38';
+const ST_AUTHORIZED = 'beee8bc0-5a0d-11f1-0a80-1ae90004ebf1';
+const ST_PAID       = 'bef10ed6-5a0d-11f1-0a80-1ae90004ebf4';
+async function msSetOrderState(orderId, stateId) {
+  const r = await fetch(MS_API + '/entity/customerorder/' + orderId, {
+    method: 'PUT', headers: msAuthHeaders(true),
+    body: JSON.stringify({ state: { meta: {
+      href: MS_API + '/entity/customerorder/metadata/states/' + stateId,
+      type: 'state', mediaType: 'application/json'
+    } } })
+  });
+  if (!r.ok) console.warn('msSetOrderState', orderId, '→', stateId, 'HTTP', r.status);
+  return r.ok;
+}
+let _abandonedBusy = false;
+async function reconcileAbandonedPayments() {
+  if (_abandonedBusy || !process.env.MS_TOKEN) return;
+  let creds; try { creds = alfaCredentials(); } catch(e) { return; }
+  _abandonedBusy = true;
+  try {
+    const r = await fetch(MS_API + '/entity/customerorder?limit=50&order=created,desc&expand=state', { headers: msAuthHeaders() });
+    const rows = (await r.json()).rows || [];
+    const now = Date.now();
+    for (const o of rows) {
+      if (!o.state || o.state.id !== ST_NEW) continue;                       // только «Новый»
+      if ((o.description || '').indexOf('Картой онлайн') === -1) continue;  // наличные не трогаем
+      const attr = (o.attributes || []).find(a => a.name === 'Alfa orderId');
+      const alfaOrderId = attr && attr.value;
+      if (!alfaOrderId) continue;                                            // платёж не привязан — не рискуем
+      const created = Date.parse((o.created || '').replace(' ', 'T') + '+03:00'); // время МС — московское
+      const ageMin = created ? (now - created) / 60000 : 0;
+      if (ageMin < 2) continue;                                              // даём оплате завершиться
+      const stRes = await fetch(ALFA_API + '/getOrderStatusExtended.do', {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ orderId: alfaOrderId, ...creds }).toString()
+      });
+      const st = await stRes.json();
+      const os = st.orderStatus ?? st.OrderStatus;
+      if (os === 1 || os === 2) {
+        // оплачен, но клиент не вернулся в приложение — отмечаем оплату сами
+        await msSetOrderState(o.id, os === 2 ? ST_PAID : ST_AUTHORIZED);
+        console.log('ABANDONED paid:', o.name, '→', os === 2 ? 'PAID' : 'AUTHORIZED');
+      } else if (ageMin >= 25 && (os === 0 || os === 3 || os === 6)) {
+        // сессия оплаты (20 мин) истекла, платежа нет — заказ не состоялся
+        await msSetOrderState(o.id, CANCELLED_STATE);
+        console.log('ABANDONED cancel:', o.name, 'alfa status', os);
+      }
+    }
+  } catch(e) {
+    console.warn('reconcileAbandonedPayments:', e.message);
+  } finally { _abandonedBusy = false; }
+}
+setInterval(reconcileAbandonedPayments, 60000);
 
 // Диагностика уведомлений: состояние наблюдателя + тест отправки (?send=<chatId>)
 app.get('/tg/debug', async (req, res) => {
