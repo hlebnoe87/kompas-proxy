@@ -928,6 +928,9 @@ const ORDER_MSG = {
 // Следим за сменой статуса активных заказов и шлём уведомление в Telegram
 const orderStageSeen = new Map(); // orderId → последняя замеченная стадия
 let orderWatchBaseline = false;   // первый прогон — базовая линия (без рассылки)
+// Push сборщикам о новых заказах: помним, о каких уже уведомили
+const ST_ACCEPTED = '6b9511c9-02a8-11ed-0a80-073c00232c39';
+const pickerNotified = new Set();
 let _lastWatch = { at: null, rows: 0, changed: 0, sent: 0, error: null };
 async function watchOrderStatuses() {
   if (!process.env.MS_TOKEN) return;
@@ -941,6 +944,22 @@ async function watchOrderStatuses() {
       const stage = stageFromStateName(o.state && o.state.name);
       const prev  = orderStageSeen.get(o.id);
       orderStageSeen.set(o.id, stage);
+
+      // Push на ТСД сборщиков: заказ впервые стал видимым для сборки
+      // (наличные — сразу «Новый»; онлайн — только после оплаты, статус «Оплачен онлайн»)
+      const stId = o.state && o.state.id;
+      const pickerVisible = stId === ST_ACCEPTED || stId === ST_AUTHORIZED ||
+        (stId === ST_NEW && (o.description || '').indexOf('Картой онлайн') === -1);
+      if (pickerVisible && !pickerNotified.has(o.id)) {
+        pickerNotified.add(o.id);
+        if (pickerNotified.size > 2000) pickerNotified.clear(); // страховка от роста памяти
+        if (orderWatchBaseline) {
+          const pn = await sendPushToClient('sborka-pickers', '🔔 Компас.Сборка',
+            'Новый заказ ' + (o.name || '') + ' на сборку');
+          if (pn) console.log('PUSH sborka: новый заказ', o.name, '×' + pn);
+        }
+      }
+
       if (!orderWatchBaseline) continue;                  // первый прогон — только запоминаем
       if (prev === undefined || prev === stage) continue; // нет смены статуса
       changed++;
