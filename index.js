@@ -10,9 +10,11 @@ app.get('/', (req, res) => res.json({ ok: true, service: 'kompas-proxy' }));
 
 // ── Безопасность: CORS только с разрешённых доменов ──
 const ALLOWED_ORIGINS = ['https://kompas87.ru', 'https://www.kompas87.ru'];
+// Локальная разработка: приложение, открытое через http://localhost:*/http://127.0.0.1:*
+const isLocalDevOrigin = o => /^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(o);
 app.use((req, res, next) => {
   const origin = req.headers.origin || '';
-  if (ALLOWED_ORIGINS.includes(origin)) {
+  if (ALLOWED_ORIGINS.includes(origin) || isLocalDevOrigin(origin)) {
     res.header('Access-Control-Allow-Origin', origin);
   } else if (!origin && (req.path.startsWith('/payment/') || req.path.startsWith('/proxy/'))) {
     // Разрешаем без Origin только для внутренних запросов с сервера
@@ -92,6 +94,13 @@ app.get('/sborka/locks', (req, res) => {
   const out = {};
   for (const [id, l] of sborkaLocks) out[id] = { name: l.name, t: l.t };
   res.json(out);
+});
+
+// Заказы, видимые сборщику прямо сейчас — лёгкий опрос для нативной службы APK-обёртки ТСД.
+// Кэш наполняется наблюдателем watchOrderStatuses (раз в 30 сек), лишней нагрузки на МС нет.
+let pickerPendingCache = { at: 0, orders: [] };
+app.get('/sborka/pending', (req, res) => {
+  res.json(pickerPendingCache);
 });
 
 // ── WEB PUSH УВЕДОМЛЕНИЯ ──
@@ -940,6 +949,7 @@ async function watchOrderStatuses() {
     const data = await r.json();
     const rows = data.rows || [];
     let changed = 0, sent = 0;
+    const pendingNow = []; // для /sborka/pending (нативная служба APK)
     for (const o of rows) {
       const stage = stageFromStateName(o.state && o.state.name);
       const prev  = orderStageSeen.get(o.id);
@@ -950,6 +960,7 @@ async function watchOrderStatuses() {
       const stId = o.state && o.state.id;
       const pickerVisible = stId === ST_ACCEPTED || stId === ST_AUTHORIZED ||
         (stId === ST_NEW && (o.description || '').indexOf('Картой онлайн') === -1);
+      if (pickerVisible) pendingNow.push({ id: o.id, name: o.name || '' });
       if (pickerVisible && !pickerNotified.has(o.id)) {
         pickerNotified.add(o.id);
         if (pickerNotified.size > 2000) pickerNotified.clear(); // страховка от роста памяти
@@ -978,6 +989,7 @@ async function watchOrderStatuses() {
       if (pushed) { sent += pushed; console.log('PUSH notify:', o.name, '→ stage', stage, '×' + pushed); }
     }
     orderWatchBaseline = true;
+    pickerPendingCache = { at: Date.now(), orders: pendingNow };
     _lastWatch = { at: new Date().toISOString(), rows: rows.length, changed, sent, error: rows.length ? null : 'no rows' };
   } catch(e) {
     _lastWatch = { at: new Date().toISOString(), rows: 0, changed: 0, sent: 0, error: e.message };
