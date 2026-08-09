@@ -666,130 +666,31 @@ app.get('/miniature/*', async (req, res) => {
 });
 
 
-// ── Подтверждение номера: звонок (основной) + SMS (резерв) ──
-const crypto = require('crypto');
-const smsTokens = new Map(); // phone → { code, expires, attempts }
+// ── VK ID: данные пользователя по access_token ──
+// Токен приходит с клиента после VKID.Auth.exchangeCode (PKCE, секрет не нужен).
+// user_info возвращает имя, телефон и email (при scope 'phone email' в виджете).
+const VK_APP_ID = process.env.VK_APP_ID || '54713637';
 
-// Лимиты на отправку кодов — защита баланса от перебора/выжигания.
-// Ключ = канал + телефон: не чаще 1 раза в минуту и не более 10 в сутки.
-const codeSendLog = new Map(); // key → { last, day, count }
-function codeSendAllowed(key) {
-  const now = Date.now();
-  const today = new Date().toISOString().slice(0, 10);
-  const e = codeSendLog.get(key) || { last: 0, day: today, count: 0 };
-  if (e.day !== today) { e.day = today; e.count = 0; }
-  if (now - e.last < 60 * 1000) return { ok: false, error: 'Повторная отправка возможна через минуту' };
-  if (e.count >= 10) return { ok: false, error: 'Превышен дневной лимит. Попробуйте завтра.' };
-  e.last = now; e.count++;
-  codeSendLog.set(key, e);
-  return { ok: true };
-}
-// Чистим старые записи раз в сутки, чтобы Map не рос бесконечно
-setInterval(() => {
-  const today = new Date().toISOString().slice(0, 10);
-  for (const [k, v] of codeSendLog) if (v.day !== today) codeSendLog.delete(k);
-}, 24 * 60 * 60 * 1000).unref();
-
-// Звонок-сброс через SMS.RU: робот звонит абоненту, код = последние 4 цифры
-// входящего номера. Дешевле SMS (~0.4₽ против ~4-6₽), бесплатно для клиента.
-// SMS.RU возвращает код сразу в ответе — храним его так же, как SMS-код.
-// Требует переменную окружения SMSRU_API_ID (ключ из личного кабинета sms.ru).
-app.post('/call/send', async (req, res) => {
-  const phone = (req.body.phone || '').replace(/\D/g, '');
-  if (!phone || phone.length < 10) {
-    return res.status(400).json({ error: 'Неверный номер телефона' });
-  }
-  const apiId = process.env.SMSRU_API_ID || '';
-  if (!apiId) {
-    console.error('SMSRU: не задан SMSRU_API_ID — звонки недоступны, клиент перейдёт на SMS');
-    return res.status(500).json({ error: 'call_not_configured' });
-  }
-  const lim = codeSendAllowed('call:' + phone);
-  if (!lim.ok) return res.status(429).json({ error: lim.error });
-
+app.post('/vk/userinfo', async (req, res) => {
+  const token = (req.body.access_token || '').trim();
+  if (!token) return res.status(400).json({ error: 'Нет access_token' });
   try {
-    // ip нужен антифроду sms.ru; за прокси Amvera реальный адрес — в X-Forwarded-For
-    const ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-1';
-    const url = 'https://sms.ru/code/call?api_id=' + encodeURIComponent(apiId)
-      + '&phone=' + encodeURIComponent(phone) + '&ip=' + encodeURIComponent(ip);
-    const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    const r = await fetch('https://id.vk.com/oauth2/user_info', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: 'client_id=' + encodeURIComponent(VK_APP_ID) + '&access_token=' + encodeURIComponent(token),
+      signal: AbortSignal.timeout(10000)
+    });
     const data = await r.json();
-    console.log('Звонок-код на', phone, ':', data.status, data.status_code || '');
-    if (data.status !== 'OK' || !data.code) {
-      return res.status(500).json({ error: 'Не удалось выполнить звонок' + (data.status_text ? ': ' + data.status_text : '') });
+    if (data.error || !data.user) {
+      console.error('VK user_info:', data.error || 'нет user', data.error_description || '');
+      return res.status(401).json({ error: 'VK не подтвердил вход. Попробуйте ещё раз.' });
     }
-    smsTokens.set(phone, { code: String(data.code), expires: Date.now() + 5 * 60 * 1000, attempts: 0 });
-    res.json({ ok: true, phone });
+    res.json({ user: data.user });
   } catch (e) {
-    console.error('SMSRU error:', e.message);
-    res.status(500).json({ error: 'Не удалось выполнить звонок' });
+    console.error('VK user_info error:', e.message);
+    res.status(500).json({ error: 'Не удалось получить данные VK' });
   }
-});
-
-// Отправка SMS с кодом (резервный канал, SMSC.ru)
-app.post('/sms/send', async (req, res) => {
-  const phone = (req.body.phone || '').replace(/\D/g, '');
-  if (!phone || phone.length < 10) {
-    return res.status(400).json({ error: 'Неверный номер телефона' });
-  }
-  const lim = codeSendAllowed('sms:' + phone);
-  if (!lim.ok) return res.status(429).json({ error: lim.error });
-
-  // Генерируем 4-значный код
-  const code = String(Math.floor(1000 + Math.random() * 9000));
-  const expires = Date.now() + 5 * 60 * 1000; // 5 минут
-  smsTokens.set(phone, { code, expires, attempts: 0 });
-
-  const login    = process.env.SMSC_LOGIN    || '';
-  const password = process.env.SMSC_PASSWORD || '';
-  if (!login || !password) {
-    console.error('SMSC: не заданы SMSC_LOGIN/SMSC_PASSWORD в переменных окружения');
-    return res.status(500).json({ error: 'SMS-сервис не настроен. Обратитесь в поддержку.' });
-  }
-  // encodeURIComponent обязателен: спецсимволы в пароле (&, +, %) ломают URL → «parameters error»
-  const message = encodeURIComponent(`Компас.Доставка: код входа ${code}. Никому не сообщайте.`);
-  const smscUrl = `https://smsc.ru/sys/send.php?login=${encodeURIComponent(login)}&psw=${encodeURIComponent(password)}&phones=${encodeURIComponent(phone)}&mes=${message}&fmt=3&charset=utf-8`;
-
-  try {
-    const r = await fetch(smscUrl, { signal: AbortSignal.timeout(10000) });
-    const data = await r.json();
-    console.log('SMS отправлено на', phone, ':', data);
-    if (data.error_code) {
-      // Коды SMSC: 1 — ошибка в параметрах, 2 — неверный логин/пароль, 3 — недостаточно средств
-      return res.status(500).json({ error: 'Ошибка отправки SMS: ' + data.error + ' (код ' + data.error_code + ')' });
-    }
-    res.json({ ok: true, phone });
-  } catch(e) {
-    console.error('SMSC error:', e.message);
-    res.status(500).json({ error: 'Не удалось отправить SMS' });
-  }
-});
-
-// Проверка кода
-app.post('/sms/verify', async (req, res) => {
-  const phone = (req.body.phone || '').replace(/\D/g, '');
-  const code  = (req.body.code  || '').trim();
-
-  const entry = smsTokens.get(phone);
-  if (!entry) {
-    return res.status(400).json({ error: 'Код не найден. Запросите новый.' });
-  }
-  if (Date.now() > entry.expires) {
-    smsTokens.delete(phone);
-    return res.status(400).json({ error: 'Код истёк. Запросите новый.' });
-  }
-  entry.attempts = (entry.attempts || 0) + 1;
-  if (entry.attempts > 5) {
-    smsTokens.delete(phone);
-    return res.status(429).json({ error: 'Слишком много попыток. Запросите новый код.' });
-  }
-  if (entry.code !== code) {
-    return res.status(400).json({ error: 'Неверный код. Попробуйте ещё раз.' });
-  }
-
-  // Код верный — удаляем
-  smsTokens.delete(phone);
-  res.json({ ok: true, phone });
 });
 
 
