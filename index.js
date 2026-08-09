@@ -684,15 +684,21 @@ app.post('/sms/send', async (req, res) => {
 
   const login    = process.env.SMSC_LOGIN    || '';
   const password = process.env.SMSC_PASSWORD || '';
-  const message  = encodeURIComponent(`Компас.Доставка: код входа ${code}. Никому не сообщайте.`);
-  const smscUrl  = `https://smsc.ru/sys/send.php?login=${login}&psw=${password}&phones=${phone}&mes=${message}&fmt=3&charset=utf-8`;
+  if (!login || !password) {
+    console.error('SMSC: не заданы SMSC_LOGIN/SMSC_PASSWORD в переменных окружения');
+    return res.status(500).json({ error: 'SMS-сервис не настроен. Обратитесь в поддержку.' });
+  }
+  // encodeURIComponent обязателен: спецсимволы в пароле (&, +, %) ломают URL → «parameters error»
+  const message = encodeURIComponent(`Компас.Доставка: код входа ${code}. Никому не сообщайте.`);
+  const smscUrl = `https://smsc.ru/sys/send.php?login=${encodeURIComponent(login)}&psw=${encodeURIComponent(password)}&phones=${encodeURIComponent(phone)}&mes=${message}&fmt=3&charset=utf-8`;
 
   try {
     const r = await fetch(smscUrl, { signal: AbortSignal.timeout(10000) });
     const data = await r.json();
     console.log('SMS отправлено на', phone, ':', data);
     if (data.error_code) {
-      return res.status(500).json({ error: 'Ошибка отправки SMS: ' + data.error });
+      // Коды SMSC: 1 — ошибка в параметрах, 2 — неверный логин/пароль, 3 — недостаточно средств
+      return res.status(500).json({ error: 'Ошибка отправки SMS: ' + data.error + ' (код ' + data.error_code + ')' });
     }
     res.json({ ok: true, phone });
   } catch(e) {
