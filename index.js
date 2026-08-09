@@ -666,16 +666,74 @@ app.get('/miniature/*', async (req, res) => {
 });
 
 
-// ── SMS верификация через SMSC.ru ──
+// ── Подтверждение номера: звонок (основной) + SMS (резерв) ──
 const crypto = require('crypto');
-const smsTokens = new Map(); // phone → { code, expires }
+const smsTokens = new Map(); // phone → { code, expires, attempts }
 
-// Отправка SMS с кодом
+// Лимиты на отправку кодов — защита баланса от перебора/выжигания.
+// Ключ = канал + телефон: не чаще 1 раза в минуту и не более 10 в сутки.
+const codeSendLog = new Map(); // key → { last, day, count }
+function codeSendAllowed(key) {
+  const now = Date.now();
+  const today = new Date().toISOString().slice(0, 10);
+  const e = codeSendLog.get(key) || { last: 0, day: today, count: 0 };
+  if (e.day !== today) { e.day = today; e.count = 0; }
+  if (now - e.last < 60 * 1000) return { ok: false, error: 'Повторная отправка возможна через минуту' };
+  if (e.count >= 10) return { ok: false, error: 'Превышен дневной лимит. Попробуйте завтра.' };
+  e.last = now; e.count++;
+  codeSendLog.set(key, e);
+  return { ok: true };
+}
+// Чистим старые записи раз в сутки, чтобы Map не рос бесконечно
+setInterval(() => {
+  const today = new Date().toISOString().slice(0, 10);
+  for (const [k, v] of codeSendLog) if (v.day !== today) codeSendLog.delete(k);
+}, 24 * 60 * 60 * 1000).unref();
+
+// Звонок-сброс через SMS.RU: робот звонит абоненту, код = последние 4 цифры
+// входящего номера. Дешевле SMS (~0.4₽ против ~4-6₽), бесплатно для клиента.
+// SMS.RU возвращает код сразу в ответе — храним его так же, как SMS-код.
+// Требует переменную окружения SMSRU_API_ID (ключ из личного кабинета sms.ru).
+app.post('/call/send', async (req, res) => {
+  const phone = (req.body.phone || '').replace(/\D/g, '');
+  if (!phone || phone.length < 10) {
+    return res.status(400).json({ error: 'Неверный номер телефона' });
+  }
+  const apiId = process.env.SMSRU_API_ID || '';
+  if (!apiId) {
+    console.error('SMSRU: не задан SMSRU_API_ID — звонки недоступны, клиент перейдёт на SMS');
+    return res.status(500).json({ error: 'call_not_configured' });
+  }
+  const lim = codeSendAllowed('call:' + phone);
+  if (!lim.ok) return res.status(429).json({ error: lim.error });
+
+  try {
+    // ip нужен антифроду sms.ru; за прокси Amvera реальный адрес — в X-Forwarded-For
+    const ip = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '-1';
+    const url = 'https://sms.ru/code/call?api_id=' + encodeURIComponent(apiId)
+      + '&phone=' + encodeURIComponent(phone) + '&ip=' + encodeURIComponent(ip);
+    const r = await fetch(url, { signal: AbortSignal.timeout(15000) });
+    const data = await r.json();
+    console.log('Звонок-код на', phone, ':', data.status, data.status_code || '');
+    if (data.status !== 'OK' || !data.code) {
+      return res.status(500).json({ error: 'Не удалось выполнить звонок' + (data.status_text ? ': ' + data.status_text : '') });
+    }
+    smsTokens.set(phone, { code: String(data.code), expires: Date.now() + 5 * 60 * 1000, attempts: 0 });
+    res.json({ ok: true, phone });
+  } catch (e) {
+    console.error('SMSRU error:', e.message);
+    res.status(500).json({ error: 'Не удалось выполнить звонок' });
+  }
+});
+
+// Отправка SMS с кодом (резервный канал, SMSC.ru)
 app.post('/sms/send', async (req, res) => {
   const phone = (req.body.phone || '').replace(/\D/g, '');
   if (!phone || phone.length < 10) {
     return res.status(400).json({ error: 'Неверный номер телефона' });
   }
+  const lim = codeSendAllowed('sms:' + phone);
+  if (!lim.ok) return res.status(429).json({ error: lim.error });
 
   // Генерируем 4-значный код
   const code = String(Math.floor(1000 + Math.random() * 9000));
