@@ -26,13 +26,17 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Rate limiting: не более 200 запросов в минуту с одного IP ──
+// ── Rate limiting: защита от злоупотреблений ──
+// Лимит 1000/мин: фотографии товаров грузятся сотнями запросов за сессию,
+// прежние 200/мин резали их (HTTP 429) и ломали загрузку фото и каталога.
+// /miniature/* (картинки, кэшируются браузером на сутки) вообще не считаем.
 const rateLimitMap = new Map();
 app.use((req, res, next) => {
+  if (req.path.startsWith('/miniature/')) return next();
   const ip  = req.ip || req.connection.remoteAddress;
   const now = Date.now();
   const windowMs = 60000;
-  const max = 200;
+  const max = 1000;
   if (!rateLimitMap.has(ip)) rateLimitMap.set(ip, []);
   const requests = rateLimitMap.get(ip).filter(t => now - t < windowMs);
   requests.push(now);
@@ -308,6 +312,22 @@ const ALLOWED_MS_PATHS = [
 const MIN_PAYMENT = 100;
 const MAX_PAYMENT = 99999900; // 999 999 ₽
 
+// ── Кэш тяжёлых GET-ответов МойСклад ──
+// /entity/assortment (~6 МБ) и /report/stock/bystore (~3.5 МБ) отдаются ~15 секунд —
+// клиент с таймаутом 15 сек часто не дожидался ответа, и каталог «не прогружался».
+// Кэш на 60 сек: первый запрос идёт в МойСклад, остальные получают ответ мгновенно.
+// Одновременные «холодные» запросы объединяются в один (in-flight дедупликация),
+// чтобы не уткнуться в лимиты МойСклада.
+const MS_CACHE_TTL = 60 * 1000;
+const MS_CACHEABLE = ['/entity/assortment', '/report/stock'];
+const msCache = new Map(); // key → { t, status, body } | { t, pending: Promise }
+
+function msCacheableKey(req, path, query) {
+  if (req.method !== 'GET') return null;
+  if (!MS_CACHEABLE.some(p => path.startsWith(p))) return null;
+  return path + query;
+}
+
 app.all('/proxy/*', async (req, res) => {
   const path  = req.path.replace('/proxy', '');
   const query = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
@@ -319,6 +339,20 @@ app.all('/proxy/*', async (req, res) => {
     return res.status(403).json({ error: 'Forbidden' });
   }
 
+  const cacheKey = msCacheableKey(req, path, query);
+  if (cacheKey) {
+    const hit = msCache.get(cacheKey);
+    if (hit && Date.now() - hit.t < MS_CACHE_TTL && hit.body !== undefined) {
+      return res.status(hit.status).header('Content-Type', 'application/json').send(hit.body);
+    }
+    if (hit && hit.pending) {
+      // Уже есть запрос к МойСкладу в полёте — ждём его результат
+      const done = await hit.pending;
+      if (done) return res.status(done.status).header('Content-Type', 'application/json').send(done.body);
+      // pending завершился ошибкой — падаем в основной путь и пробуем сами
+    }
+  }
+
   const msUrl = 'https://api.moysklad.ru/api/remap/1.2' + path + query;
   try {
     const headers = { 'Authorization': 'Bearer ' + process.env.MS_TOKEN };
@@ -326,9 +360,26 @@ app.all('/proxy/*', async (req, res) => {
     const options = { method: req.method, headers };
     if ((req.method === 'POST' || req.method === 'PUT') && req.body) options.body = JSON.stringify(req.body);
     console.log(req.method, msUrl);
-    const response = await fetch(msUrl, options);
-    const text = await response.text();
-    res.status(response.status).header('Content-Type', 'application/json').send(text);
+
+    const doFetch = async () => {
+      const response = await fetch(msUrl, options);
+      const text = await response.text();
+      return { status: response.status, body: text };
+    };
+
+    let result;
+    if (cacheKey) {
+      const pending = doFetch().then(r => {
+        if (r.status === 200) msCache.set(cacheKey, { t: Date.now(), status: r.status, body: r.body });
+        else msCache.delete(cacheKey);
+        return r;
+      }).catch(e => { msCache.delete(cacheKey); throw e; });
+      msCache.set(cacheKey, { t: Date.now(), pending });
+      result = await pending;
+    } else {
+      result = await doFetch();
+    }
+    res.status(result.status).header('Content-Type', 'application/json').send(result.body);
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -696,21 +747,41 @@ app.post('/vk/userinfo', async (req, res) => {
 
 // ── Восстановление пароля по email ──
 const nodemailer = require('nodemailer');
+const recoveryAttempts = new Map(); // ip → { n, t } — анти-перебор сброса пароля
 
 app.post('/mail/recovery', async (req, res) => {
-  const email   = (req.body.email || '').trim();
+  const email   = (req.body.email || '').trim().toLowerCase();
   const agentId = req.body.agentId;
   if (!email || !agentId) {
     return res.status(400).json({ error: 'Не указан email' });
   }
 
+  // Анти-перебор: не более 5 сбросов с одного IP за 15 минут
+  const ip = req.ip || req.connection.remoteAddress || '';
+  const now = Date.now();
+  const ra = recoveryAttempts.get(ip) || { n: 0, t: now };
+  if (now - ra.t > 15 * 60000) { ra.n = 0; ra.t = now; }
+  if (ra.n >= 5) return res.status(429).json({ error: 'Слишком много попыток. Попробуйте позже.' });
+
   try {
-    // Получаем пароль контрагента из МоегоСклада
+    // Получаем контрагента из МоегоСклада
     const agentR = await fetch('https://api.moysklad.ru/api/remap/1.2/entity/counterparty/' + agentId, {
       headers: { 'Authorization': 'Bearer ' + process.env.MS_TOKEN }
     });
     const agent = await agentR.json();
     const passAttr = agent.attributes && agent.attributes.find(a => a.name === 'Пароль');
+
+    // ПИСЬМО УХОДИТ ТОЛЬКО НА EMAIL ИЗ КАРТОЧКИ КЛИЕНТА в МойСклад.
+    // Раньше письмо с новым паролем уходило на email из запроса — зная agentId,
+    // можно было сбросить чужой пароль и получить его на СВОЮ почту.
+    const agentEmail = (agent.email || '').trim().toLowerCase();
+    if (!agentEmail || agentEmail !== email) {
+      // Не раскрываем, что именно не совпало — одинаковый ответ в обоих случаях
+      ra.n++;
+      recoveryAttempts.set(ip, ra);
+      return res.status(404).json({ error: 'Аккаунт с таким email не найден' });
+    }
+    ra.n = 0; recoveryAttempts.set(ip, ra);
 
     // Пароль хранится в виде хеша — восстановить нельзя, генерируем новый
     // Генерируем временный пароль
@@ -885,8 +956,15 @@ async function tgHandleUpdate(update, TG_TOKEN) {
   }
 }
 
-// Запускаем цикл polling
-setInterval(tgPoll, 1000);
+// Запускаем цикл polling ПОСЛЕДОВАТЕЛЬНО: long-poll длится до 20 сек,
+// а setInterval(1 сек) запускал ~20 параллельных getUpdates с одинаковым
+// offset — одно сообщение от клиента обрабатывалось несколько раз подряд.
+(async function tgPollLoop() {
+  while (true) {
+    await tgPoll();
+    await new Promise(r => setTimeout(r, 1000));
+  }
+})();
 
 // Отправка сообщения в Telegram
 async function tgSend(token, chatId, text, replyMarkup) {
@@ -1038,6 +1116,11 @@ async function watchOrderStatuses() {
       if (pushed) { sent += pushed; console.log('PUSH notify:', o.name, '→ stage', stage, '×' + pushed); }
     }
     orderWatchBaseline = true;
+    // Чистим карту от заказов, которые вышли за пределы последних 100 — иначе росла бесконечно
+    if (orderStageSeen.size > 500) {
+      const alive = new Set(rows.map(o => o.id));
+      for (const id of orderStageSeen.keys()) if (!alive.has(id)) orderStageSeen.delete(id);
+    }
     pickerPendingCache = { at: Date.now(), orders: pendingNow };
     _lastWatch = { at: new Date().toISOString(), rows: rows.length, changed, sent, error: rows.length ? null : 'no rows' };
   } catch(e) {
@@ -1142,12 +1225,20 @@ function parseUsersFrom(singleEnv, prefix) {
 function getSborkaUsers()  { return parseUsersFrom('SBORKA_USERS',  'SBORKA_USER');  }
 function getCourierUsers() { return parseUsersFrom('COURIER_USERS', 'COURIER_USER'); }
 
+const sborkaLoginAttempts = new Map(); // ip → { n, t } — анти-перебор PIN
 app.post('/sborka/login', (req, res) => {
+  const ip = req.ip || req.connection.remoteAddress || '';
+  const now = Date.now();
+  const a = sborkaLoginAttempts.get(ip) || { n: 0, t: now };
+  if (now - a.t > 15 * 60000) { a.n = 0; a.t = now; }
+  if (a.n >= 10) return res.status(429).json({ error: 'Слишком много попыток. Подождите 15 минут.' });
   const pin = (req.body.pin || '').trim();
   const pickers = getSborkaUsers();
-  if (pickers[pin]) return res.json({ ok: true, name: pickers[pin], pin, role: 'picker' });
+  if (pickers[pin]) { a.n = 0; sborkaLoginAttempts.set(ip, a); return res.json({ ok: true, name: pickers[pin], pin, role: 'picker' }); }
   const couriers = getCourierUsers();
-  if (couriers[pin]) return res.json({ ok: true, name: couriers[pin], pin, role: 'courier' });
+  if (couriers[pin]) { a.n = 0; sborkaLoginAttempts.set(ip, a); return res.json({ ok: true, name: couriers[pin], pin, role: 'courier' }); }
+  a.n++;
+  sborkaLoginAttempts.set(ip, a);
   res.status(401).json({ error: 'Неверный PIN-код' });
 });
 
