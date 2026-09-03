@@ -839,6 +839,110 @@ app.post('/mail/recovery', async (req, res) => {
 });
 
 
+// ── ВХОД ПО КОДУ НА EMAIL ──
+// 1) /auth/email/start — шлём 6-значный код (живёт 10 мин, храним только хеш)
+// 2) /auth/email/verify — сверяем код, ищем контрагента по email в МойСклад.
+//    Код никогда не покидает сервер, в ответе — только ok и данные клиента.
+const crypto = require('crypto');
+const emailCodes   = new Map(); // email → { hash, expires, attempts }
+const emailSendLog = new Map(); // 'em:'+email / 'ip:'+ip → [timestamps]
+
+function emailCodeHash(email, code) {
+  return crypto.createHash('sha256').update('kompas87:' + email + ':' + code).digest('hex');
+}
+function authRateHit(key, max, windowMs) {
+  const now = Date.now();
+  const arr = (emailSendLog.get(key) || []).filter(t => now - t < windowMs);
+  if (arr.length >= max) { emailSendLog.set(key, arr); return true; }
+  arr.push(now);
+  emailSendLog.set(key, arr);
+  return false;
+}
+// Периодическая чистка протухших кодов и логов — чтобы Map не росли бесконечно
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of emailCodes)   if (!v || v.expires < now) emailCodes.delete(k);
+  for (const [k, v] of emailSendLog) if (!v.length || now - v[v.length - 1] > 3600000) emailSendLog.delete(k);
+}, 10 * 60000);
+
+app.post('/auth/email/start', async (req, res) => {
+  try {
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+      return res.status(400).json({ error: 'Введите корректный email' });
+    }
+    const ip = req.ip || req.connection.remoteAddress || '';
+    // Анти-спам: 3 письма на email и 10 писем с IP за 15 минут
+    if (authRateHit('em:' + email, 3, 15 * 60000) || authRateHit('ip:' + ip, 10, 15 * 60000)) {
+      return res.status(429).json({ error: 'Слишком много отправок. Попробуйте через 15 минут.' });
+    }
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    emailCodes.set(email, { hash: emailCodeHash(email, code), expires: Date.now() + 10 * 60000, attempts: 0 });
+
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.mail.ru', port: 465, secure: true,
+      auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS }
+    });
+    await transporter.sendMail({
+      from: '"Компас.Доставка" <' + process.env.MAIL_USER + '>',
+      to: email,
+      subject: 'Код входа — Компас.Доставка',
+      text: 'Здравствуйте!\n\nВаш код для входа в приложение Компас.Доставка:\n\n' + code +
+            '\n\nКод действует 10 минут. Никому не сообщайте его.\n' +
+            'Если вы не запрашивали код — просто проигнорируйте это письмо.',
+      html: '<div style="font-family:Arial,sans-serif;max-width:480px;margin:0 auto">' +
+            '<div style="background:#1F9B5E;color:#fff;padding:20px;border-radius:12px 12px 0 0;text-align:center">' +
+            '<h2 style="margin:0">Компас.Доставка</h2></div>' +
+            '<div style="padding:24px;background:#f9f9f9;border-radius:0 0 12px 12px;text-align:center">' +
+            '<p style="text-align:left">Здравствуйте!</p>' +
+            '<p style="text-align:left">Ваш код для входа в приложение:</p>' +
+            '<div style="background:#fff;border:2px solid #1F9B5E;border-radius:10px;padding:16px;font-size:32px;font-weight:bold;letter-spacing:6px;color:#1F9B5E;margin:16px 0">' + code + '</div>' +
+            '<p style="color:#888;font-size:13px">Код действует 10 минут. Никому не сообщайте его.</p>' +
+            '<p style="color:#888;font-size:13px">Если вы не запрашивали код — просто проигнорируйте это письмо.</p>' +
+            '</div></div>'
+    });
+    console.log('EMAIL AUTH: код отправлен на', email);
+    res.json({ ok: true });
+  } catch(e) {
+    console.error('EMAIL AUTH start:', e.message);
+    res.status(500).json({ error: 'Не удалось отправить письмо. Попробуйте позже.' });
+  }
+});
+
+app.post('/auth/email/verify', async (req, res) => {
+  try {
+    const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+    const code  = String((req.body && req.body.code) || '').replace(/\D/g, '');
+    const rec = emailCodes.get(email);
+    if (!rec || Date.now() > rec.expires) {
+      emailCodes.delete(email);
+      return res.status(400).json({ error: 'Код устарел. Запросите новый.' });
+    }
+    rec.attempts++;
+    if (rec.attempts > 5) {
+      emailCodes.delete(email);
+      return res.status(429).json({ error: 'Слишком много неверных попыток. Запросите новый код.' });
+    }
+    if (code.length !== 6 || emailCodeHash(email, code) !== rec.hash) {
+      return res.status(400).json({ error: 'Неверный код. Осталось попыток: ' + (5 - rec.attempts) });
+    }
+    emailCodes.delete(email); // код одноразовый
+
+    // Код верный — ищем клиента в МойСклад по email
+    const r = await fetch(MS_API + '/entity/counterparty?filter=email=' + encodeURIComponent(email) + '&limit=5', {
+      headers: msAuthHeaders()
+    });
+    const data = await r.json().catch(() => ({}));
+    const agent = (data.rows || []).find(a => (a.email || '').trim().toLowerCase() === email) || null;
+    console.log('EMAIL AUTH: вход', email, agent ? '→ клиент ' + agent.id : '→ новый пользователь');
+    res.json({ ok: true, agent });
+  } catch(e) {
+    console.error('EMAIL AUTH verify:', e.message);
+    res.status(500).json({ error: 'Ошибка проверки кода. Попробуйте ещё раз.' });
+  }
+});
+
+
 // ── TELEGRAM ВХОД (вариант Б — запрос контакта) ──
 const tgSessions = new Map(); // sessionId → { phone, status, tgPhone, expires }
 
