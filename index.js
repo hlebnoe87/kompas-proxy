@@ -313,14 +313,64 @@ const MIN_PAYMENT = 100;
 const MAX_PAYMENT = 99999900; // 999 999 ₽
 
 // ── Кэш тяжёлых GET-ответов МойСклад ──
-// /entity/assortment (~6 МБ) и /report/stock/bystore (~3.5 МБ) отдаются ~15 секунд —
-// клиент с таймаутом 15 сек часто не дожидался ответа, и каталог «не прогружался».
-// Кэш на 60 сек: первый запрос идёт в МойСклад, остальные получают ответ мгновенно.
-// Одновременные «холодные» запросы объединяются в один (in-flight дедупликация),
-// чтобы не уткнуться в лимиты МойСклада.
+// /entity/assortment (~6 МБ) и /report/stock/bystore (~3.5 МБ) отдаются медленно,
+// а канал Amvera ограничен (~16 КБ/с под нагрузкой) — 6 МБ ехали бы 6 минут.
+// Поэтому: 1) выкидываем из ответа всё, что клиент не использует (в 3-4 раза меньше);
+//          2) жмём gzip (ещё в ~8-10 раз меньше);
+//          3) кэшируем на 60 сек — МойСклад дёргается один раз в минуту максимум.
+// Одновременные «холодные» запросы объединяются в один (in-flight дедупликация).
+const zlib = require('zlib');
 const MS_CACHE_TTL = 60 * 1000;
 const MS_CACHEABLE = ['/entity/assortment', '/report/stock'];
-const msCache = new Map(); // key → { t, status, body } | { t, pending: Promise }
+const msCache = new Map(); // key → { t, status, body, gz } | { t, pending: Promise }
+
+// Клиенту из строки ассортимента нужны только эти поля
+function slimAssortRow(p) {
+  const o = {
+    name: p.name, archived: p.archived, pathName: p.pathName,
+    volume: p.volume, weight: p.weight, meta: p.meta
+  };
+  if (p.productFolder) o.productFolder = { name: p.productFolder.name };
+  if (p.uom)           o.uom = { name: p.uom.name };
+  if (p.images)        o.images = { meta: p.images.meta };
+  if (p.attributes)    o.attributes = p.attributes.map(a => ({ name: a.name, value: a.value }));
+  if (p.salePrices)    o.salePrices = p.salePrices.map(sp => ({
+    value: sp.value,
+    priceType: sp.priceType ? { name: sp.priceType.name, meta: sp.priceType.meta } : undefined
+  }));
+  if (p.discounts)     o.discounts = p.discounts;
+  return o;
+}
+function slimStockRow(r) {
+  return {
+    name: r.name, meta: r.meta,
+    stockByStore: (r.stockByStore || []).map(s => ({ meta: s.meta, stock: s.stock }))
+  };
+}
+// Оставляем в ответе только нужное клиенту (6 МБ → ~1.5 МБ до сжатия)
+function slimMsJson(path, text) {
+  try {
+    const data = JSON.parse(text);
+    if (!data || !Array.isArray(data.rows)) return text;
+    let rows = data.rows;
+    if (path.startsWith('/entity/assortment')) rows = rows.map(slimAssortRow);
+    else if (path.startsWith('/report/stock')) rows = rows.map(slimStockRow);
+    else return text;
+    return JSON.stringify({ meta: { size: (data.meta && data.meta.size) || rows.length }, rows });
+  } catch(e) { return text; } // не JSON — отдаём как есть
+}
+function clientAcceptsGzip(req) {
+  return String(req.headers['accept-encoding'] || '').includes('gzip');
+}
+function sendMsPayload(req, res, status, body, gz) {
+  if (gz && clientAcceptsGzip(req)) {
+    return res.status(status)
+      .header('Content-Type', 'application/json')
+      .header('Content-Encoding', 'gzip')
+      .send(gz);
+  }
+  return res.status(status).header('Content-Type', 'application/json').send(body);
+}
 
 function msCacheableKey(req, path, query) {
   if (req.method !== 'GET') return null;
@@ -343,12 +393,16 @@ app.all('/proxy/*', async (req, res) => {
   if (cacheKey) {
     const hit = msCache.get(cacheKey);
     if (hit && Date.now() - hit.t < MS_CACHE_TTL && hit.body !== undefined) {
-      return res.status(hit.status).header('Content-Type', 'application/json').send(hit.body);
+      return sendMsPayload(req, res, hit.status, hit.body, hit.gz);
     }
     if (hit && hit.pending) {
       // Уже есть запрос к МойСкладу в полёте — ждём его результат
       const done = await hit.pending;
-      if (done) return res.status(done.status).header('Content-Type', 'application/json').send(done.body);
+      if (done) {
+        const cached = msCache.get(cacheKey);
+        if (cached && cached.body !== undefined) return sendMsPayload(req, res, cached.status, cached.body, cached.gz);
+        return sendMsPayload(req, res, done.status, done.body, null);
+      }
       // pending завершился ошибкой — падаем в основной путь и пробуем сами
     }
   }
@@ -367,18 +421,25 @@ app.all('/proxy/*', async (req, res) => {
       return { status: response.status, body: text };
     };
 
-    let result;
     if (cacheKey) {
       const pending = doFetch().then(r => {
-        if (r.status === 200) msCache.set(cacheKey, { t: Date.now(), status: r.status, body: r.body });
-        else msCache.delete(cacheKey);
+        if (r.status === 200) {
+          const slim = slimMsJson(path, r.body);
+          let gz = null;
+          try { gz = zlib.gzipSync(slim, { level: 6 }); } catch(e) {}
+          msCache.set(cacheKey, { t: Date.now(), status: r.status, body: slim, gz });
+        } else {
+          msCache.delete(cacheKey);
+        }
         return r;
       }).catch(e => { msCache.delete(cacheKey); throw e; });
       msCache.set(cacheKey, { t: Date.now(), pending });
-      result = await pending;
-    } else {
-      result = await doFetch();
+      const result = await pending;
+      const cached = msCache.get(cacheKey);
+      if (cached && cached.body !== undefined) return sendMsPayload(req, res, cached.status, cached.body, cached.gz);
+      return sendMsPayload(req, res, result.status, result.body, null);
     }
+    const result = await doFetch();
     res.status(result.status).header('Content-Type', 'application/json').send(result.body);
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -871,6 +932,11 @@ app.post('/auth/email/start', async (req, res) => {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
       return res.status(400).json({ error: 'Введите корректный email' });
     }
+    // Явно сообщаем о не настроенной почте, а не маскируем под общую 500
+    if (!process.env.MAIL_USER || !process.env.MAIL_PASS) {
+      console.error('EMAIL AUTH start: MAIL_USER или MAIL_PASS не заданы в переменных окружения');
+      return res.status(503).json({ error: 'Почтовая служба не настроена на сервере. Используйте вход через ВКонтакте.' });
+    }
     const ip = req.ip || req.connection.remoteAddress || '';
     // Анти-спам: 3 письма на email и 10 писем с IP за 15 минут
     if (authRateHit('em:' + email, 3, 15 * 60000) || authRateHit('ip:' + ip, 10, 15 * 60000)) {
@@ -905,7 +971,50 @@ app.post('/auth/email/start', async (req, res) => {
     res.json({ ok: true });
   } catch(e) {
     console.error('EMAIL AUTH start:', e.message);
-    res.status(500).json({ error: 'Не удалось отправить письмо. Попробуйте позже.' });
+    // Частые причины: неверный пароль приложения mail.ru (535), сеть/порт (ETIMEDOUT, ECONNREFUSED)
+    let hint = 'Не удалось отправить письмо. Попробуйте позже.';
+    if (e && e.responseCode === 535) hint = 'Почтовый сервер отклонил логин/пароль. Нужен пароль приложения mail.ru.';
+    else if (e && (e.code === 'ETIMEDOUT' || e.code === 'ECONNREFUSED' || e.code === 'ESOCKET')) hint = 'Серверу не удаётся подключиться к почте (smtp.mail.ru:465).';
+    res.status(500).json({ error: hint });
+  }
+});
+
+// Диагностика почтовых настроек. Защищено кодом замка: /mail/diag?pin=<APP_LOCK_PIN>
+// Не отправляет писем — только проверяет соединение с smtp.mail.ru и логин/пароль.
+app.get('/mail/diag', async (req, res) => {
+  if (String(req.query.pin || '') !== String(process.env.APP_LOCK_PIN || '')) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  const userSet = !!process.env.MAIL_USER;
+  const passSet = !!process.env.MAIL_PASS;
+  if (!userSet || !passSet) {
+    return res.json({
+      userSet, passSet,
+      user: userSet ? String(process.env.MAIL_USER).replace(/^(.{2}).+(@.+)$/, '$1***$2') : null,
+      verify: 'not_configured',
+      hint: 'Задайте переменные MAIL_USER (полный адрес ящика) и MAIL_PASS (пароль приложения mail.ru) в настройках Amvera и перезапустите приложение.'
+    });
+  }
+  try {
+    const t = nodemailer.createTransport({
+      host: 'smtp.mail.ru', port: 465, secure: true,
+      connectionTimeout: 10000, greetingTimeout: 10000, socketTimeout: 15000,
+      auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS }
+    });
+    await t.verify();
+    res.json({ userSet, passSet, user: String(process.env.MAIL_USER).replace(/^(.{2}).+(@.+)$/, '$1***$2'), verify: 'ok' });
+  } catch (e) {
+    let hint = '';
+    if (e && e.responseCode === 535) hint = 'Ящик/пароль отклонены. Для mail.ru нужен «пароль приложения»: Почта → Настройки → Безопасность → Пароли для внешних приложений. Обычный пароль не подойдёт.';
+    else if (e && (e.code === 'ETIMEDOUT' || e.code === 'ECONNREFUSED' || e.code === 'ESOCKET')) hint = 'Нет соединения с smtp.mail.ru:465 — вероятно, хостинг блокирует исходящий SMTP. Напишите в поддержку Amvera.';
+    res.json({
+      userSet, passSet,
+      user: String(process.env.MAIL_USER).replace(/^(.{2}).+(@.+)$/, '$1***$2'),
+      verify: 'error',
+      code: e.code || null, responseCode: e.responseCode || null,
+      message: String(e.message || e).slice(0, 300),
+      hint
+    });
   }
 });
 
