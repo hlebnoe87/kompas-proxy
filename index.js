@@ -191,6 +191,254 @@ function agentIdFromOrder(o) {
   return href.split('/').pop().split('?')[0] || null;
 }
 
+// ── MAX-БОТ «Компас.Курьеры»: карточки заказов в закрытый канал курьеров ──
+// Новый заказ → сообщение с кнопкой «Принять заказ». Первый нажавший курьер
+// забирает заказ: кнопка пропадает у всех, в канал уходит «Заказ № … принят
+// курьером ФИО», клиенту — «В пути» (общее ядро acceptOrderCore).
+// Callback-кнопки принимаем long polling'ом (GET /updates) — публичный вебхук
+// и открытый входящий порт не нужны, работает из любого контейнера.
+const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN || 'f9LHodD0cOIUSFxiRPZi4Iq1lmuUQWO8XY6qqd4rEfKUU5hDZ2krtuKLMLH33ftoahR3IPAcWNAcO8VqBIRk';
+const MAX_CHAT_ID   = process.env.MAX_CHAT_ID   || '-79168565055513'; // канал «Компас.Курьеры»
+const MAX_API       = 'https://botapi.max.ru';
+function maxEnabled() { return !!MAX_BOT_TOKEN && !!MAX_CHAT_ID; }
+async function maxApi(method, path, query, body) {
+  const qs = new URLSearchParams(query || {}).toString();
+  const r = await fetch(MAX_API + path + (qs ? '?' + qs : ''), {
+    method,
+    headers: Object.assign({ Authorization: MAX_BOT_TOKEN }, body ? { 'Content-Type': 'application/json' } : {}),
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const err = new Error('MAX ' + method + ' ' + path + ' → HTTP ' + r.status + ' ' + JSON.stringify(data).slice(0, 200));
+    err.status = r.status;
+    throw err;
+  }
+  return data;
+}
+
+// Кто какой заказ принял — переживает перезапуск (хранилище рядом с push-подписками)
+const MAX_ACCEPT_STORE = process.env.MAX_ACCEPT_STORE || (fs.existsSync('/data') ? '/data/max-accepted.json' : './max-accepted.json');
+let maxAccepted = {}; // msOrderId → { by, at, msgId }
+try { maxAccepted = JSON.parse(fs.readFileSync(MAX_ACCEPT_STORE, 'utf8')) || {}; } catch(e) {}
+function saveMaxAccepted() {
+  try { fs.writeFileSync(MAX_ACCEPT_STORE, JSON.stringify(maxAccepted)); } catch(e) { console.warn('max accept store:', e.message); }
+}
+
+// Адрес доставки: сначала поле shipmentAddress, запасной вариант — строка «Адрес:» из комментария
+function orderAddress(o) {
+  if (o.shipmentAddress) return o.shipmentAddress;
+  const m = (o.description || '').match(/Адрес:\s*(.+)/);
+  return m ? m[1].trim() : 'Адрес не указан';
+}
+
+// Способ оплаты и сумма к оплате: из комментария заказа, запасной вариант — сумма документа (копейки)
+function orderPayInfo(o) {
+  const desc = o.description || '';
+  const pm = desc.match(/Оплата:\s*(.+)/);
+  const sm = desc.match(/К оплате[^:]*:\s*([\d\s]+)\s*₽/);
+  const method = pm ? pm[1].trim() : '';
+  let total = sm ? sm[1].replace(/\s+/g, ' ').trim() : '';
+  if (!total && o.sum != null) total = String(Math.round(o.sum / 100));
+  return { method, total };
+}
+
+// Строка оплаты для карточки: курьер должен сразу видеть, брать ли деньги с клиента
+function orderPayLine(o) {
+  const pay = orderPayInfo(o);
+  if (/налич/i.test(pay.method)) {
+    return '💵 Оплата: наличными' + (pay.total ? ' — взять с клиента ' + pay.total + ' ₽' : '');
+  }
+  if (pay.method) {
+    return '💳 Оплата: ' + pay.method + (pay.total ? ' (' + pay.total + ' ₽ — оплачено)' : '');
+  }
+  if (pay.total) return '💰 К оплате: ' + pay.total + ' ₽';
+  return '💳 Оплата: не указана';
+}
+
+// Карточка нового заказа в канал курьеров с кнопкой «Принять заказ»
+async function maxSendNewOrder(o) {
+  if (!maxEnabled()) return false;
+  const agent = o.agent || {};
+  const text = '🆕 Новый заказ № ' + (o.name || '—') + '\n\n' +
+               '👤 ' + (agent.name || 'Клиент') + '\n' +
+               '📞 ' + (agent.phone || '—') + '\n' +
+               '📍 ' + orderAddress(o) + '\n' +
+               orderPayLine(o);
+  const resp = await maxApi('POST', '/messages', { chat_id: MAX_CHAT_ID }, {
+    text,
+    attachments: [{ type: 'inline_keyboard', payload: { buttons: [[
+      { type: 'callback', text: '✅ Принять заказ', payload: 'accept:' + o.id }
+    ]] } }]
+  });
+  const mid = resp && resp.message && resp.message.body && resp.message.body.mid;
+  console.log('MAX: карточка заказа', o.name, 'отправлена, mid', mid);
+  return true;
+}
+
+// Разбор нажатий кнопок в канале: «Принять заказ» и «Заказ доставлен»
+async function maxHandleCallback(cb, message) {
+  const callbackId = cb && cb.callback_id;
+  const payload    = String((cb && cb.payload) || '');
+  const u   = (cb && cb.user) || {};
+  const fio = [u.first_name, u.last_name].filter(Boolean).join(' ').trim() || ('user_' + (u.user_id || '?'));
+  const mid = message && message.body && message.body.mid;
+  const isAccept    = payload.indexOf('accept:') === 0;
+  const isDelivered = payload.indexOf('delivered:') === 0;
+  if (!callbackId || (!isAccept && !isDelivered)) return;
+  const msOrderId = payload.slice(payload.indexOf(':') + 1);
+  const answer = notification =>
+    maxApi('POST', '/answers', {}, { callback_id: callbackId, notification })
+      .catch(e => console.warn('MAX answer:', e.message));
+
+  // Тестовая кнопка из /max/test — в МойСклад не ходим
+  if (msOrderId === 'TEST') {
+    await answer('Тестовая кнопка работает ✅');
+    if (mid) await maxApi('PUT', '/messages', { message_id: mid }, { text: '✅ Тест: кнопка нажата — ' + fio, attachments: [] })
+      .catch(e => console.warn('MAX edit:', e.message));
+    return;
+  }
+
+  // ── «📦 Заказ доставлен» ──
+  if (isDelivered) {
+    const rec = maxAccepted[msOrderId];
+    if (!rec) { await answer('Сначала нужно принять заказ'); return; }
+    if (rec.delivered) { await answer('Заказ уже отмечен доставленным (' + rec.delivered.by + ')'); return; }
+    // Отметить доставку может только тот курьер, который принял заказ
+    if (rec.uid && u.user_id && String(rec.uid) !== String(u.user_id)) {
+      await answer('Заказ везёт курьер ' + rec.by);
+      return;
+    }
+    rec.delivered = { by: fio, at: Date.now() }; // бронируем синхронно — повторный клик не пройдёт
+    saveMaxAccepted();
+    await answer('Заказ доставлен ✅');
+
+    // Убираем кнопку, помечаем карточку
+    if (mid) {
+      const oldText = (message.body && message.body.text) || '';
+      await maxApi('PUT', '/messages', { message_id: mid }, {
+        text: oldText + '\n📦 Доставлен курьером ' + fio,
+        attachments: []
+      }).catch(e => console.warn('MAX edit:', e.message));
+    }
+
+    // Уведомление в канал + статус «Доставлен» в МойСклад
+    // (клиенту «Заказ доставлен» пришлёт наблюдатель watchOrderStatuses по смене статуса)
+    let orderName = '';
+    try {
+      const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
+      if (oRes.ok) { const o = await oRes.json(); orderName = o.name || ''; }
+    } catch(e) {}
+    await maxApi('POST', '/messages', { chat_id: MAX_CHAT_ID },
+      { text: '📦 Заказ № ' + (orderName || msOrderId) + ' доставлен. Курьер: ' + fio })
+      .catch(e => console.warn('MAX notify:', e.message));
+    try {
+      await msSetOrderState(msOrderId, ST_DELIVERED);
+    } catch(e) { console.warn('MAX delivered state:', e.message); }
+    console.log('MAX: заказ', orderName || msOrderId, 'доставлен курьером', fio);
+    return;
+  }
+
+  // ── «✅ Принять заказ» ──
+  // Заказ уже принят ранее — честно отвечаем нажавшему
+  if (maxAccepted[msOrderId]) {
+    await answer('Заказ уже принят курьером ' + maxAccepted[msOrderId].by);
+    return;
+  }
+  // Бронируем заказ СРАЗУ (синхронно) — второй клик уже не пройдёт
+  maxAccepted[msOrderId] = { by: fio, uid: u.user_id || null, at: Date.now(), msgId: mid || null };
+  saveMaxAccepted();
+
+  // Всплывающее подтверждение нажавшему курьеру
+  await answer('Вы приняли заказ ✅');
+
+  // Помечаем карточку и меняем кнопку на «Заказ доставлен»
+  if (mid) {
+    const oldText = (message.body && message.body.text) || '';
+    await maxApi('PUT', '/messages', { message_id: mid }, {
+      text: oldText + '\n\n✅ Заказ принят курьером ' + fio,
+      attachments: [{ type: 'inline_keyboard', payload: { buttons: [[
+        { type: 'callback', text: '📦 Заказ доставлен', payload: 'delivered:' + msOrderId }
+      ]] } }]
+    }).catch(e => console.warn('MAX edit:', e.message));
+  }
+
+  // Отдельное уведомление в канал
+  let orderName = '';
+  try {
+    const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
+    if (oRes.ok) { const o = await oRes.json(); orderName = o.name || ''; }
+  } catch(e) {}
+  await maxApi('POST', '/messages', { chat_id: MAX_CHAT_ID },
+    { text: '🛵 Заказ № ' + (orderName || msOrderId) + ' принят курьером ' + fio })
+    .catch(e => console.warn('MAX notify:', e.message));
+
+  // Фиксируем курьера в МойСклад и уведомляем клиента («В пути»)
+  const r = await acceptOrderCore(msOrderId, fio, '');
+  if (!r.ok) console.warn('MAX accept core:', r.error);
+  console.log('MAX: заказ', orderName || msOrderId, 'принят курьером', fio);
+}
+
+// Long polling callback-кнопок: публичный вебхук не нужен
+let maxMarker = null;
+const maxPollState = { running: false, lastError: null, lastUpdateAt: null, startedAt: null };
+async function maxPollLoop() {
+  if (!maxEnabled() || maxPollState.running) return;
+  maxPollState.running = true;
+  maxPollState.startedAt = new Date().toISOString();
+  console.log('MAX: polling запущен, чат', MAX_CHAT_ID);
+  while (maxEnabled()) {
+    try {
+      const q = { types: 'message_callback', timeout: 30, limit: 100 };
+      if (maxMarker != null) q.marker = maxMarker;
+      const data = await maxApi('GET', '/updates', q);
+      const updates = data.updates || [];
+      if (data.marker != null) maxMarker = data.marker;
+      for (const upd of updates) {
+        if (upd.update_type !== 'message_callback') continue;
+        maxPollState.lastUpdateAt = new Date().toISOString();
+        try { await maxHandleCallback(upd.callback || {}, upd.message || {}); }
+        catch(e) { console.warn('MAX callback:', e.message); }
+      }
+    } catch(e) {
+      maxPollState.lastError = e.message;
+      console.warn('MAX polling:', e.message);
+      await new Promise(r => setTimeout(r, 5000)); // backoff при сбое сети/API
+    }
+  }
+  maxPollState.running = false;
+}
+
+// Диагностика MAX-интеграции (тот же PIN, что и у /mail/diag)
+app.get('/max/diag', async (req, res) => {
+  const gate = process.env.APP_LOCK_PIN;
+  if (!gate) return res.status(503).json({ error: 'diag_disabled', hint: 'Задайте APP_LOCK_PIN в переменных Amvera — этот же код будет ключом к диагностике.' });
+  if (String(req.query.pin || '') !== String(gate)) return res.status(403).json({ error: 'forbidden' });
+  const out = { enabled: maxEnabled(), chatId: MAX_CHAT_ID, polling: maxPollState, acceptedCount: Object.keys(maxAccepted).length };
+  try {
+    const me = await maxApi('GET', '/me');
+    out.bot = { name: me.name, username: me.username, user_id: me.user_id };
+  } catch(e) { out.botError = e.message; }
+  res.json(out);
+});
+
+// Тестовая карточка с кнопкой — проверка канала без реального заказа
+app.post('/max/test', async (req, res) => {
+  const gate = process.env.APP_LOCK_PIN;
+  if (!gate) return res.status(503).json({ error: 'diag_disabled' });
+  const pin = String(req.query.pin || (req.body && req.body.pin) || '');
+  if (pin !== String(gate)) return res.status(403).json({ error: 'forbidden' });
+  try {
+    await maxApi('POST', '/messages', { chat_id: MAX_CHAT_ID }, {
+      text: '🆕 Тестовый заказ № TEST\n\n👤 Тестов Тест Тестович\n📞 +7 000 000-00-00\n📍 Билибино, ул. Тестовая, 1\n💵 Оплата: наличными — взять с клиента 1 250 ₽',
+      attachments: [{ type: 'inline_keyboard', payload: { buttons: [[
+        { type: 'callback', text: '✅ Принять заказ', payload: 'accept:TEST' }
+      ]] } }]
+    });
+    res.json({ ok: true });
+  } catch(e) { res.status(502).json({ error: e.message }); }
+});
+
 // Credentials только из переменных окружения — не из кода.
 // Если пароль содержит символы, которые панель не принимает (например «!»),
 // задайте ALFA_PASS_B64 = пароль в base64 — он имеет приоритет над ALFA_PASS.
@@ -731,31 +979,41 @@ app.post('/order/set-state', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// Курьер принимает заказ: пишем его имя+телефон в Комментарий + шлём клиенту «В пути» в Telegram
+// Общее ядро «курьер принял заказ»: комментарий в МС + уведомление клиенту «В пути».
+// Телефон может быть пустым — у MAX-профиля курьера телефона нет.
+async function acceptOrderCore(msOrderId, courierName, courierPhone) {
+  const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId + '?expand=agent', { headers: msAuthHeaders() });
+  if (!oRes.ok) { const t = await oRes.text(); console.warn('accept read MS', oRes.status, t.slice(0,150)); return { ok: false, error: 'moysklad_' + oRes.status }; }
+  const order = await oRes.json();
+  // дописываем курьера в комментарий (прежнюю строку курьера, если была, заменяем)
+  const baseDesc = (order.description || '').replace(/^🛵 Курьер:.*(\r?\n)?/m, '').trim();
+  const courierLine = '🛵 Курьер: ' + courierName + (courierPhone ? ' | ' + courierPhone : '');
+  const upd = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
+    method: 'PUT', headers: msAuthHeaders(true),
+    body: JSON.stringify({ description: courierLine + (baseDesc ? '\n\n' + baseDesc : '') })
+  });
+  if (!upd.ok) { const t = await upd.text(); console.warn('accept MS', upd.status, t.slice(0,150)); return { ok: false, error: 'moysklad_' + upd.status }; }
+  // Уведомление клиенту «В пути» с контактами курьера: Telegram + web push
+  const inTransitMsg = '🛵 Заказ ' + (order.name || '') + ' уже в пути!\nКурьер: ' + courierName +
+    (courierPhone ? '\nТелефон: ' + courierPhone : '');
+  const chatId = await getChatIdForOrder(order);
+  if (chatId && process.env.TG_BOT_TOKEN) {
+    await tgSend(process.env.TG_BOT_TOKEN, chatId, inTransitMsg);
+  }
+  sendPushToClient(agentIdFromOrder(order), 'Компас.Доставка', inTransitMsg).catch(() => {});
+  console.log('ACCEPT order', msOrderId, 'courier', courierName);
+  return { ok: true };
+}
+
+// Курьер принимает заказ из приложения курьера: имя + телефон обязательны
 app.post('/order/accept', async (req, res) => {
   try {
     const msOrderId = req.body.msOrderId;
     const courierName  = (req.body.courierName  || '').toString().trim().slice(0, 80);
     const courierPhone = (req.body.courierPhone || '').toString().trim().slice(0, 30);
     if (!msOrderId || !courierName || !courierPhone) return res.status(400).json({ error: 'msOrderId, courierName, courierPhone обязательны' });
-    const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId + '?expand=agent', { headers: msAuthHeaders() });
-    const order = await oRes.json();
-    // дописываем курьера в комментарий (прежнюю строку курьера, если была, заменяем)
-    const baseDesc = (order.description || '').replace(/^🛵 Курьер:.*(\r?\n)?/m, '').trim();
-    const newDesc = '🛵 Курьер: ' + courierName + ' | ' + courierPhone + (baseDesc ? '\n\n' + baseDesc : '');
-    const upd = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
-      method: 'PUT', headers: msAuthHeaders(true),
-      body: JSON.stringify({ description: newDesc })
-    });
-    if (!upd.ok) { const t = await upd.text(); console.warn('accept MS', upd.status, t.slice(0,150)); return res.status(502).json({ error: 'moysklad_' + upd.status }); }
-    // Уведомление клиенту «В пути» с контактами курьера: Telegram + web push
-    const inTransitMsg = '🛵 Заказ ' + (order.name || '') + ' уже в пути!\nКурьер: ' + courierName + '\nТелефон: ' + courierPhone;
-    const chatId = await getChatIdForOrder(order);
-    if (chatId && process.env.TG_BOT_TOKEN) {
-      await tgSend(process.env.TG_BOT_TOKEN, chatId, inTransitMsg);
-    }
-    sendPushToClient(agentIdFromOrder(order), 'Компас.Доставка', inTransitMsg).catch(() => {});
-    console.log('ACCEPT order', msOrderId, 'courier', courierName);
+    const r = await acceptOrderCore(msOrderId, courierName, courierPhone);
+    if (!r.ok) return res.status(502).json({ error: r.error });
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -982,7 +1240,11 @@ app.post('/auth/email/start', async (req, res) => {
 // Диагностика почтовых настроек. Защищено кодом замка: /mail/diag?pin=<APP_LOCK_PIN>
 // Не отправляет писем — только проверяет соединение с smtp.mail.ru и логин/пароль.
 app.get('/mail/diag', async (req, res) => {
-  if (String(req.query.pin || '') !== String(process.env.APP_LOCK_PIN || '')) {
+  const gate = process.env.APP_LOCK_PIN;
+  if (!gate) {
+    return res.status(503).json({ error: 'diag_disabled', hint: 'Задайте APP_LOCK_PIN в переменных Amvera — этот же код будет ключом к диагностике.' });
+  }
+  if (String(req.query.pin || '') !== String(gate)) {
     return res.status(403).json({ error: 'forbidden' });
   }
   const userSet = !!process.env.MAIL_USER;
@@ -1279,11 +1541,12 @@ const orderStageSeen = new Map(); // orderId → последняя замече
 let orderWatchBaseline = false;   // первый прогон — базовая линия (без рассылки)
 // Push сборщикам о новых заказах: помним, о каких уже уведомили
 const ST_ACCEPTED = '6b9511c9-02a8-11ed-0a80-073c00232c39';
+const ST_DELIVERED = '6b95140d-02a8-11ed-0a80-073c00232c3c'; // ставит курьер (кнопка в MAX)
 const pickerNotified = new Set();
 let _lastWatch = { at: null, rows: 0, changed: 0, sent: 0, error: null };
 async function watchOrderStatuses() {
   if (!process.env.MS_TOKEN) return;
-  if (!process.env.TG_BOT_TOKEN && !pushEnabled()) return; // ни одного канала уведомлений
+  if (!process.env.TG_BOT_TOKEN && !pushEnabled() && !maxEnabled()) return; // ни одного канала уведомлений
   try {
     const r = await fetch(MS_API + '/entity/customerorder?limit=100&order=updated,desc&expand=state,agent', { headers: msAuthHeaders() });
     const data = await r.json();
@@ -1308,6 +1571,10 @@ async function watchOrderStatuses() {
           const pn = await sendPushToClient('sborka-pickers', '🔔 Компас.Сборка',
             'Новый заказ ' + (o.name || '') + ' на сборку');
           if (pn) console.log('PUSH sborka: новый заказ', o.name, '×' + pn);
+          // Карточка заказа в MAX-канал курьеров с кнопкой «Принять заказ»
+          try {
+            if (await maxSendNewOrder(o)) console.log('MAX: заказ', o.name, '→ канал курьеров');
+          } catch(e) { console.warn('MAX send:', e.message); }
         }
       }
 
@@ -1342,6 +1609,7 @@ async function watchOrderStatuses() {
   }
 }
 setInterval(watchOrderStatuses, 30000);
+maxPollLoop(); // MAX-бот: слушаем нажатия «Принять заказ» (long polling, вебхук не нужен)
 
 // ── СТОРОЖ БРОШЕННЫХ ОПЛАТ ──
 // Заказ создаётся в МС до оплаты (иначе при сбое возврата из банка были бы «деньги без заказа»).
