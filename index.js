@@ -107,6 +107,58 @@ app.get('/sborka/pending', (req, res) => {
   res.json(pickerPendingCache);
 });
 
+// ── ТВ-ТАБЛО ДАРКСТОРА ──
+// Активные заказы для экрана в дарксторе (как табло в McDonald's):
+// показываем всё, что ещё не доставлено/не отменено; выполненные пропадают сами.
+// Кэш 10 сек — телевизор опрашивает часто, МойСклад при этом не нагружается.
+const ST_ASSEMBLY = '6b95126d-02a8-11ed-0a80-073c00232c3a';
+const ST_COURIER  = '6b951305-02a8-11ed-0a80-073c00232c3b';
+function boardStage(o) {
+  const stId = o.state && o.state.id;
+  // Известные ID статусов: 1 — готовится (новый/принят/оплачен), 2 — сборка, 3 — у курьера
+  if (stId === ST_NEW || stId === ST_ACCEPTED || stId === ST_AUTHORIZED || stId === ST_PAID) {
+    // Неоплаченный онлайн-заказ в статусе «Новый» — ещё не заказ, на табло не выводим
+    if (stId === ST_NEW && (o.description || '').indexOf('Картой онлайн') !== -1) return 0;
+    return 1;
+  }
+  if (stId === ST_ASSEMBLY) return 2;
+  if (stId === ST_COURIER)  return 3;
+  // Запасной путь — по имени статуса (если в МС появятся новые статусы)
+  const s = stageFromStateName(o.state && o.state.name);
+  return (s >= 1 && s <= 3) ? s : 0; // 0/4/5/6/-1 — не показываем
+}
+let boardCache = { at: 0, payload: { at: null, orders: [] } };
+app.get('/board/orders', async (req, res) => {
+  try {
+    if (Date.now() - boardCache.at < 10000) return res.json(boardCache.payload);
+    const r = await fetch(MS_API + '/entity/customerorder?limit=100&order=created,desc&expand=state', { headers: msAuthHeaders() });
+    if (!r.ok) { const t = await r.text(); console.warn('board MS', r.status, t.slice(0,150)); return res.status(502).json({ error: 'moysklad_' + r.status }); }
+    const data = await r.json();
+    const now = Date.now();
+    const orders = [];
+    for (const o of (data.rows || [])) {
+      const stage = boardStage(o);
+      if (!stage) continue;
+      // moment в МойСклад — московское время без таймзоны; возраст считаем на сервере
+      let ageMin = null;
+      if (o.moment) {
+        const t = Date.parse(String(o.moment).replace(' ', 'T') + '+03:00');
+        if (!isNaN(t)) ageMin = Math.max(0, Math.round((now - t) / 60000));
+      }
+      orders.push({
+        id: o.id, name: o.name || '', stage,
+        moment: o.moment || '',
+        ageMin,
+        sum: o.sum != null ? Math.round(o.sum / 100) : null,
+        positions: (o.positions && o.positions.meta && o.positions.meta.size) || 0
+      });
+    }
+    orders.sort((a, b) => (a.moment || '').localeCompare(b.moment || '')); // старые первыми — очередь
+    boardCache = { at: Date.now(), payload: { at: new Date().toISOString(), orders } };
+    res.json(boardCache.payload);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── WEB PUSH УВЕДОМЛЕНИЯ ──
 // Требует: пакет web-push в package.json + env VAPID_PUBLIC_KEY / VAPID_PRIVATE_KEY
 // (сгенерировать: npx web-push generate-vapid-keys). Подписки живут в /data — переживают рестарты.
@@ -1015,6 +1067,27 @@ app.post('/order/accept', async (req, res) => {
     const r = await acceptOrderCore(msOrderId, courierName, courierPhone);
     if (!r.ok) return res.status(502).json({ error: r.error });
     res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Подсказки адресов DaData через прокси ──
+// Токен живёт на сервере (env DADATA_TOKEN): в клиенте он был доступен любому,
+// кто открыл исходник, — и бесплатную дневную квоту могли сжечь извне, тогда
+// подсказки адресов пропадали у всех пользователей до конца суток.
+// Заодно снимаем зависимость от доступности suggestions.dadata.ru из сети клиента.
+app.post('/addr/suggest', async (req, res) => {
+  try {
+    const token = process.env.DADATA_TOKEN || 'c8d5cda7926f8a95bb054cb8517439bd57f45261';
+    const query = String((req.body && req.body.query) || '').trim().slice(0, 120);
+    if (query.length < 2) return res.json({ suggestions: [] });
+    const r = await fetch('https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address', {
+      method: 'POST',
+      headers: { 'Authorization': 'Token ' + token, 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ query, count: 7, locations: [{ city: 'Билибино' }], restrict_value: true })
+    });
+    if (!r.ok) { const t = await r.text(); console.warn('dadata suggest', r.status, t.slice(0,150)); return res.status(502).json({ error: 'dadata_' + r.status }); }
+    const data = await r.json();
+    res.json({ suggestions: data.suggestions || [] });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
