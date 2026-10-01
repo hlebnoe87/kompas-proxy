@@ -1097,7 +1097,9 @@ app.get('/miniature/*', async (req, res) => {
   const query = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
   const imgUrl = 'https://miniature-prod.moysklad.ru' + path + query;
   try {
-    const response = await fetch(imgUrl, { headers: { 'Authorization': 'Bearer ' + process.env.MS_TOKEN } });
+    // ВАЖНО: downloadHref миниатюр — публичная ссылка. Сервис миниатюр МойСклад
+    // отвечает 400 на любой запрос С заголовком Authorization — не добавляем его.
+    const response = await fetch(imgUrl);
     if (!response.ok) { res.status(response.status).send(''); return; }
     const buffer = await response.buffer();
     res.set('Content-Type', response.headers.get('content-type') || 'image/jpeg');
