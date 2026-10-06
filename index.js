@@ -604,6 +604,7 @@ const ALLOWED_MS_PATHS = [
   '/entity/employee',
   '/entity/organization',
   '/entity/currency',
+  '/entity/discount',
   '/report/stock',
   '/context/employee',
 ];
@@ -743,6 +744,77 @@ app.all('/proxy/*', async (req, res) => {
     res.status(result.status).header('Content-Type', 'application/json').send(result.body);
   } catch(e) {
     res.status(500).json({ error: e.message });
+  }
+});
+
+// ── БОНУСНАЯ ПРОГРАММА «ОСНОВНАЯ бонусная программа КоДо» ──
+// Баланс хранится в МоёмСкладе (bonusPoints контрагента),
+// операции начисления/списания — документы /entity/bonustransaction.
+let _bonusProgramMeta = null;
+async function getBonusProgramMeta() {
+  if (_bonusProgramMeta) return _bonusProgramMeta;
+  const r = await fetch(MS_API + '/entity/bonusprogram?limit=50', { headers: msAuthHeaders() });
+  if (!r.ok) throw new Error('bonusprogram: HTTP ' + r.status);
+  const d = await r.json();
+  const rows = d.rows || [];
+  // Ищем по названию «КоДо»; если не нашли — берём первую активную программу
+  const prog = rows.find(p => /КоДо/i.test(p.name || '')) || rows.find(p => p.active) || rows[0];
+  if (!prog) throw new Error('Бонусная программа не найдена в МоёмСкладе');
+  _bonusProgramMeta = prog.meta;
+  console.log('Бонусная программа:', prog.name, '(' + prog.id + ')');
+  return _bonusProgramMeta;
+}
+function msDateTimeNow() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+         p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+
+// Баланс бонусов покупателя: GET /bonus/balance?agentId=<uuid контрагента>
+app.get('/bonus/balance', async (req, res) => {
+  const agentId = String(req.query.agentId || '').trim();
+  if (!agentId) return res.status(400).json({ error: 'agentId required' });
+  try {
+    const r = await fetch(MS_API + '/entity/counterparty/' + agentId, { headers: msAuthHeaders() });
+    if (!r.ok) return res.status(r.status).json({ error: 'counterparty HTTP ' + r.status });
+    const cp = await r.json();
+    res.json({ balance: Math.round(cp.bonusPoints || 0) });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// Бонусная операция: POST /bonus/transaction { agentId, value, type: 'earn'|'spend', orderId? }
+app.post('/bonus/transaction', async (req, res) => {
+  try {
+    const { agentId, value, type, orderId } = req.body || {};
+    const v = Math.round(Number(value));
+    if (!agentId || !v || v <= 0) return res.status(400).json({ error: 'agentId и value > 0 обязательны' });
+    if (type !== 'earn' && type !== 'spend') return res.status(400).json({ error: 'type: earn | spend' });
+
+    const progMeta = await getBonusProgramMeta();
+    const body = {
+      agent:        { meta: { href: MS_API + '/entity/counterparty/' + agentId, type: 'counterparty', mediaType: 'application/json' } },
+      bonusProgram: { meta: progMeta },
+      bonusValue:   v,
+      transactionType: type === 'spend' ? 'Списание' : 'Начисление',
+      executionDate: msDateTimeNow()
+    };
+    if (orderId) {
+      body.parentDocument = { meta: { href: MS_API + '/entity/customerorder/' + orderId, type: 'customerorder', mediaType: 'application/json' } };
+    }
+    const r = await fetch(MS_API + '/entity/bonustransaction', {
+      method: 'POST', headers: msAuthHeaders(true), body: JSON.stringify(body)
+    });
+    const txt = await r.text();
+    if (!r.ok) {
+      console.error('bonustransaction error:', r.status, txt.slice(0, 400));
+      return res.status(r.status).json({ error: 'bonustransaction HTTP ' + r.status });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
   }
 });
 
