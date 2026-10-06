@@ -633,7 +633,18 @@ function slimAssortRow(p) {
   };
   if (p.productFolder) o.productFolder = { name: p.productFolder.name };
   if (p.uom)           o.uom = { name: p.uom.name };
-  if (p.images)        o.images = { meta: p.images.meta };
+  if (p.images) {
+    o.images = { meta: p.images.meta };
+    // При expand=images отдаём клиенту только ссылку на первую миниатюру —
+    // это избавляет приложение от сотен отдельных запросов /images на каждый товар
+    const firstImg = (p.images.rows || [])[0];
+    if (firstImg) {
+      o.images.rows = [{
+        miniature: firstImg.miniature ? { downloadHref: firstImg.miniature.downloadHref } : undefined,
+        tiny: firstImg.tiny ? { href: firstImg.tiny.href } : undefined
+      }];
+    }
+  }
   if (p.attributes)    o.attributes = p.attributes.map(a => ({ name: a.name, value: a.value }));
   if (p.salePrices)    o.salePrices = p.salePrices.map(sp => ({
     value: sp.value,
