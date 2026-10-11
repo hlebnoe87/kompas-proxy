@@ -131,7 +131,7 @@ let boardCache = { at: 0, payload: { at: null, orders: [] } };
 app.get('/board/orders', async (req, res) => {
   try {
     if (Date.now() - boardCache.at < 10000) return res.json(boardCache.payload);
-    const r = await fetch(MS_API + '/entity/customerorder?limit=100&order=created,desc&expand=state', { headers: msAuthHeaders() });
+    const r = await msFetchLimited(MS_API + '/entity/customerorder?limit=100&order=created,desc&expand=state', { headers: msAuthHeaders() });
     if (!r.ok) { const t = await r.text(); console.warn('board MS', r.status, t.slice(0,150)); return res.status(502).json({ error: 'moysklad_' + r.status }); }
     const data = await r.json();
     const now = Date.now();
@@ -378,7 +378,7 @@ async function maxHandleCallback(cb, message) {
     // (клиенту «Заказ доставлен» пришлёт наблюдатель watchOrderStatuses по смене статуса)
     let orderName = '';
     try {
-      const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
+      const oRes = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
       if (oRes.ok) { const o = await oRes.json(); orderName = o.name || ''; }
     } catch(e) {}
     await maxApi('POST', '/messages', { chat_id: MAX_CHAT_ID },
@@ -418,7 +418,7 @@ async function maxHandleCallback(cb, message) {
   // Отдельное уведомление в канал
   let orderName = '';
   try {
-    const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
+    const oRes = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
     if (oRes.ok) { const o = await oRes.json(); orderName = o.name || ''; }
   } catch(e) {}
   await maxApi('POST', '/messages', { chat_id: MAX_CHAT_ID },
@@ -622,7 +622,7 @@ const MAX_PAYMENT = 99999900; // 999 999 ₽
 // Одновременные «холодные» запросы объединяются в один (in-flight дедупликация).
 const zlib = require('zlib');
 const MS_CACHE_TTL = 60 * 1000;
-const MS_CACHEABLE = ['/entity/assortment', '/report/stock'];
+const MS_CACHEABLE = ['/entity/assortment', '/report/stock', '/entity/discount'];
 const msCache = new Map(); // key → { t, status, body, gz } | { t, pending: Promise }
 
 // Клиенту из строки ассортимента нужны только эти поля
@@ -728,7 +728,7 @@ app.all('/proxy/*', async (req, res) => {
     console.log(req.method, msUrl);
 
     const doFetch = async () => {
-      const response = await fetch(msUrl, options);
+      const response = await msFetchLimited(msUrl, options);
       const text = await response.text();
       return { status: response.status, body: text };
     };
@@ -764,7 +764,7 @@ app.all('/proxy/*', async (req, res) => {
 let _bonusProgramMeta = null;
 async function getBonusProgramMeta() {
   if (_bonusProgramMeta) return _bonusProgramMeta;
-  const r = await fetch(MS_API + '/entity/bonusprogram?limit=50', { headers: msAuthHeaders() });
+  const r = await msFetchLimited(MS_API + '/entity/bonusprogram?limit=50', { headers: msAuthHeaders() });
   if (!r.ok) throw new Error('bonusprogram: HTTP ' + r.status);
   const d = await r.json();
   const rows = d.rows || [];
@@ -787,7 +787,7 @@ app.get('/bonus/balance', async (req, res) => {
   const agentId = String(req.query.agentId || '').trim();
   if (!agentId) return res.status(400).json({ error: 'agentId required' });
   try {
-    const r = await fetch(MS_API + '/entity/counterparty/' + agentId, { headers: msAuthHeaders() });
+    const r = await msFetchLimited(MS_API + '/entity/counterparty/' + agentId, { headers: msAuthHeaders() });
     if (!r.ok) return res.status(r.status).json({ error: 'counterparty HTTP ' + r.status });
     const cp = await r.json();
     res.json({ balance: Math.round(cp.bonusPoints || 0) });
@@ -815,7 +815,7 @@ app.post('/bonus/transaction', async (req, res) => {
     if (orderId) {
       body.parentDocument = { meta: { href: MS_API + '/entity/customerorder/' + orderId, type: 'customerorder', mediaType: 'application/json' } };
     }
-    const r = await fetch(MS_API + '/entity/bonustransaction', {
+    const r = await msFetchLimited(MS_API + '/entity/bonustransaction', {
       method: 'POST', headers: msAuthHeaders(true), body: JSON.stringify(body)
     });
     const txt = await r.text();
@@ -966,7 +966,7 @@ let _alfaAttrMeta = null;
 async function getAlfaAttrMeta() {
   if (_alfaAttrMeta) return _alfaAttrMeta;
   try {
-    const r = await fetch(MS_API + '/entity/customerorder/metadata/attributes', { headers: msAuthHeaders() });
+    const r = await msFetchLimited(MS_API + '/entity/customerorder/metadata/attributes', { headers: msAuthHeaders() });
     const data = await r.json();
     const attr = (data.rows || []).find(a => a.name === 'Alfa orderId');
     if (attr) _alfaAttrMeta = attr.meta;
@@ -982,7 +982,7 @@ app.post('/payment/save-order-id', async (req, res) => {
     if (!msOrderId || !alfaOrderId) return res.status(400).json({ error: 'msOrderId и alfaOrderId обязательны' });
     const meta = await getAlfaAttrMeta();
     if (!meta) return res.status(500).json({ error: 'attr_not_found' });
-    const r = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
+    const r = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId, {
       method: 'PUT', headers: msAuthHeaders(true),
       body: JSON.stringify({ attributes: [{ meta, value: String(alfaOrderId) }] })
     });
@@ -999,7 +999,7 @@ app.post('/payment/capture', async (req, res) => {
     const msOrderId = req.body.msOrderId;
     if (!msOrderId) return res.status(400).json({ error: 'msOrderId обязателен' });
     // 1. находим alfaOrderId в заказе (+ отгрузки для расчёта фактической суммы)
-    const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId + '?expand=demands', { headers: msAuthHeaders() });
+    const oRes = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId + '?expand=demands', { headers: msAuthHeaders() });
     const order = await oRes.json();
     const attr = (order.attributes || []).find(a => a.name === 'Alfa orderId');
     const alfaOrderId = attr && attr.value;
@@ -1054,7 +1054,7 @@ app.post('/payment/cancel', async (req, res) => {
     const msOrderId = req.body.msOrderId;
     if (!msOrderId) return res.status(400).json({ error: 'msOrderId обязателен' });
     // alfaOrderId из заказа
-    const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
+    const oRes = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
     const order = await oRes.json();
     const attr = (order.attributes || []).find(a => a.name === 'Alfa orderId');
     const alfaOrderId = attr && attr.value;
@@ -1090,7 +1090,7 @@ app.post('/payment/cancel', async (req, res) => {
       const who = req.body.by ? (' (' + String(req.body.by).slice(0, 40) + ')') : '';
       updBody.description = '❌ Причина отмены' + who + ': ' + reason + (order.description ? '\n\n' + order.description : '');
     }
-    const upd = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
+    const upd = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId, {
       method: 'PUT', headers: msAuthHeaders(true),
       body: JSON.stringify(updBody)
     });
@@ -1104,7 +1104,7 @@ app.post('/order/set-state', async (req, res) => {
   try {
     const msOrderId = req.body.msOrderId, stateId = req.body.stateId;
     if (!msOrderId || !stateId) return res.status(400).json({ error: 'msOrderId и stateId обязательны' });
-    const r = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
+    const r = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId, {
       method: 'PUT', headers: msAuthHeaders(true),
       body: JSON.stringify({ state: { meta: { href: MS_API + '/entity/customerorder/metadata/states/' + stateId, type: 'state', mediaType: 'application/json' } } })
     });
@@ -1117,13 +1117,13 @@ app.post('/order/set-state', async (req, res) => {
 // Общее ядро «курьер принял заказ»: комментарий в МС + уведомление клиенту «В пути».
 // Телефон может быть пустым — у MAX-профиля курьера телефона нет.
 async function acceptOrderCore(msOrderId, courierName, courierPhone) {
-  const oRes = await fetch(MS_API + '/entity/customerorder/' + msOrderId + '?expand=agent', { headers: msAuthHeaders() });
+  const oRes = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId + '?expand=agent', { headers: msAuthHeaders() });
   if (!oRes.ok) { const t = await oRes.text(); console.warn('accept read MS', oRes.status, t.slice(0,150)); return { ok: false, error: 'moysklad_' + oRes.status }; }
   const order = await oRes.json();
   // дописываем курьера в комментарий (прежнюю строку курьера, если была, заменяем)
   const baseDesc = (order.description || '').replace(/^🛵 Курьер:.*(\r?\n)?/m, '').trim();
   const courierLine = '🛵 Курьер: ' + courierName + (courierPhone ? ' | ' + courierPhone : '');
-  const upd = await fetch(MS_API + '/entity/customerorder/' + msOrderId, {
+  const upd = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId, {
     method: 'PUT', headers: msAuthHeaders(true),
     body: JSON.stringify({ description: courierLine + (baseDesc ? '\n\n' + baseDesc : '') })
   });
@@ -1242,7 +1242,7 @@ app.post('/mail/recovery', async (req, res) => {
 
   try {
     // Получаем контрагента из МоегоСклада
-    const agentR = await fetch('https://api.moysklad.ru/api/remap/1.2/entity/counterparty/' + agentId, {
+    const agentR = await msFetchLimited('https://api.moysklad.ru/api/remap/1.2/entity/counterparty/' + agentId, {
       headers: { 'Authorization': 'Bearer ' + process.env.MS_TOKEN }
     });
     const agent = await agentR.json();
@@ -1274,7 +1274,7 @@ app.post('/mail/recovery', async (req, res) => {
     }
 
     if (passAttr) {
-      await fetch('https://api.moysklad.ru/api/remap/1.2/entity/counterparty/' + agentId, {
+      await msFetchLimited('https://api.moysklad.ru/api/remap/1.2/entity/counterparty/' + agentId, {
         method: 'PUT',
         headers: { 'Authorization': 'Bearer ' + process.env.MS_TOKEN, 'Content-Type': 'application/json' },
         body: JSON.stringify({ attributes: [{ meta: passAttr.meta, value: hashPass(newPass) }] })
@@ -1458,7 +1458,7 @@ app.post('/auth/email/verify', async (req, res) => {
     emailCodes.delete(email); // код одноразовый
 
     // Код верный — ищем клиента в МойСклад по email
-    const r = await fetch(MS_API + '/entity/counterparty?filter=email=' + encodeURIComponent(email) + '&limit=5', {
+    const r = await msFetchLimited(MS_API + '/entity/counterparty?filter=email=' + encodeURIComponent(email) + '&limit=5', {
       headers: msAuthHeaders()
     });
     const data = await r.json().catch(() => ({}));
@@ -1619,12 +1619,55 @@ function msAuthHeaders(json) {
   return h;
 }
 
+/* ── ОГРАНИЧИТЕЛЬ НАГРУЗКИ НА МОЙСКЛАД ──
+   Лимиты API МойСклад на аккаунт: не более 5 одновременных запросов
+   и ~45 запросов за 3 секунды. При пике заказов (несколько десятков человек
+   одновременно) без ограничителя МойСклад отвечает 429 и часть заказов падала.
+   Держим максимум 4 запроса в полёте (остальные ждут очереди) и повторяем
+   с нарастающей паузой при 429 (для GET — и при 5xx). POST при 5xx НЕ
+   повторяем, чтобы не создать дубль заказа. */
+const MS_CONCURRENCY = 4;
+let msInFlight = 0;
+const msQueue = [];
+function msAcquire() {
+  if (msInFlight < MS_CONCURRENCY) { msInFlight++; return Promise.resolve(); }
+  return new Promise(resolve => msQueue.push(resolve));
+}
+function msRelease() {
+  msInFlight--;
+  const next = msQueue.shift();
+  if (next) { msInFlight++; next(); }
+}
+const msSleep = ms => new Promise(r => setTimeout(r, ms));
+async function msFetchLimited(url, options) {
+  const method = ((options && options.method) || 'GET').toUpperCase();
+  await msAcquire();
+  try {
+    let r = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        r = await fetch(url, options);
+      } catch(e) {
+        // Сетевой сбой: GET можно повторить, POST — нет (риск дубля)
+        if (method === 'GET' && attempt < 2) { await msSleep(700 * (attempt + 1)); continue; }
+        throw e;
+      }
+      const retryable = r.status === 429 || (method === 'GET' && r.status >= 500);
+      if (!retryable || attempt === 2) return r;
+      await msSleep(700 * (attempt + 1));
+    }
+    return r;
+  } finally {
+    msRelease();
+  }
+}
+
 // meta доп.поля «Telegram chatId» у контрагента — ищем по имени, ID не хардкодим
 let _tgAttrMeta = null;
 async function getTgChatAttrMeta() {
   if (_tgAttrMeta) return _tgAttrMeta;
   try {
-    const r = await fetch(MS_API + '/entity/counterparty/metadata/attributes', { headers: msAuthHeaders() });
+    const r = await msFetchLimited(MS_API + '/entity/counterparty/metadata/attributes', { headers: msAuthHeaders() });
     const data = await r.json();
     const attr = (data.rows || []).find(a => a.name === 'Telegram chatId');
     if (attr) _tgAttrMeta = attr.meta;
@@ -1641,7 +1684,7 @@ app.post('/tg/link', async (req, res) => {
     if (!clientId || !chatId) return res.status(400).json({ error: 'clientId и chatId обязательны' });
     const meta = await getTgChatAttrMeta();
     if (!meta) return res.status(500).json({ error: 'attr_not_found' });
-    const r = await fetch(MS_API + '/entity/counterparty/' + clientId, {
+    const r = await msFetchLimited(MS_API + '/entity/counterparty/' + clientId, {
       method: 'PUT', headers: msAuthHeaders(true),
       body: JSON.stringify({ attributes: [{ meta, value: String(chatId) }] })
     });
@@ -1706,7 +1749,7 @@ async function watchOrderStatuses() {
   if (!process.env.MS_TOKEN) return;
   if (!process.env.TG_BOT_TOKEN && !pushEnabled() && !maxEnabled()) return; // ни одного канала уведомлений
   try {
-    const r = await fetch(MS_API + '/entity/customerorder?limit=100&order=updated,desc&expand=state,agent', { headers: msAuthHeaders() });
+    const r = await msFetchLimited(MS_API + '/entity/customerorder?limit=100&order=updated,desc&expand=state,agent', { headers: msAuthHeaders() });
     const data = await r.json();
     const rows = data.rows || [];
     let changed = 0, sent = 0;
@@ -1777,7 +1820,7 @@ const ST_NEW        = '6b950fea-02a8-11ed-0a80-073c00232c38';
 const ST_AUTHORIZED = 'beee8bc0-5a0d-11f1-0a80-1ae90004ebf1';
 const ST_PAID       = 'bef10ed6-5a0d-11f1-0a80-1ae90004ebf4';
 async function msSetOrderState(orderId, stateId) {
-  const r = await fetch(MS_API + '/entity/customerorder/' + orderId, {
+  const r = await msFetchLimited(MS_API + '/entity/customerorder/' + orderId, {
     method: 'PUT', headers: msAuthHeaders(true),
     body: JSON.stringify({ state: { meta: {
       href: MS_API + '/entity/customerorder/metadata/states/' + stateId,
@@ -1793,7 +1836,7 @@ async function reconcileAbandonedPayments() {
   let creds; try { creds = alfaCredentials(); } catch(e) { return; }
   _abandonedBusy = true;
   try {
-    const r = await fetch(MS_API + '/entity/customerorder?limit=50&order=created,desc&expand=state', { headers: msAuthHeaders() });
+    const r = await msFetchLimited(MS_API + '/entity/customerorder?limit=50&order=created,desc&expand=state', { headers: msAuthHeaders() });
     const rows = (await r.json()).rows || [];
     const now = Date.now();
     for (const o of rows) {
