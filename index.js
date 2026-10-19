@@ -45,27 +45,20 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Временный код-замок приложения (на время тестирования эквайринга) ──
-// Задайте APP_LOCK_PIN (6 цифр) в переменных окружения Amvera — приложение попросит код при входе.
-// Уберите переменную и перезапустите сервис — замок исчезнет, менять код приложения не нужно.
-const lockAttempts = new Map(); // ip → { n: попыток, t: начало окна }
-app.get('/app-lock/status', (req, res) => {
-  res.json({ locked: !!process.env.APP_LOCK_PIN });
-});
-app.post('/app-lock/check', (req, res) => {
-  const pin = process.env.APP_LOCK_PIN;
-  if (!pin) return res.json({ ok: true, locked: false });
-  const ip = req.ip || req.connection.remoteAddress || '';
-  const now = Date.now();
-  const a = lockAttempts.get(ip) || { n: 0, t: now };
-  if (now - a.t > 15 * 60000) { a.n = 0; a.t = now; }
-  if (a.n >= 10) return res.status(429).json({ ok: false, error: 'too_many_attempts' });
-  const ok = String((req.body && req.body.pin) || '') === String(pin);
-  a.n = ok ? 0 : a.n + 1;
-  lockAttempts.set(ip, a);
-  if (!ok) console.warn('APP-LOCK: неверный код с', ip, '(попытка ' + a.n + '/10)');
-  res.json({ ok });
-});
+// ── Код-замок приложения УДАЛЁН (19.10.2026) ──
+// Приложение открывается свободно, эндпоинты /app-lock/* больше не существуют.
+// Диагностические эндпоинты (/mail/diag, /max/diag, /max/test, /payment/env-check)
+// защищены отдельным ключом DIAG_KEY из переменных окружения Amvera.
+function diagGate(req, res) {
+  const key = process.env.DIAG_KEY;
+  if (!key) {
+    res.status(503).json({ error: 'diag_disabled', hint: 'Задайте DIAG_KEY в переменных Amvera — этот ключ будет паролем к диагностике (?pin=...).' });
+    return false;
+  }
+  const pin = String(req.query.pin || (req.body && req.body.pin) || '');
+  if (pin !== String(key)) { res.status(403).json({ error: 'forbidden' }); return false; }
+  return true;
+}
 
 // ── Серверная блокировка заказов между сборщиками ──
 // Заказ одновременно собирает только один ТСД. Хранится в памяти: перезапуск сервиса
@@ -461,11 +454,9 @@ async function maxPollLoop() {
   maxPollState.running = false;
 }
 
-// Диагностика MAX-интеграции (тот же PIN, что и у /mail/diag)
+// Диагностика MAX-интеграции (ключ DIAG_KEY)
 app.get('/max/diag', async (req, res) => {
-  const gate = process.env.APP_LOCK_PIN;
-  if (!gate) return res.status(503).json({ error: 'diag_disabled', hint: 'Задайте APP_LOCK_PIN в переменных Amvera — этот же код будет ключом к диагностике.' });
-  if (String(req.query.pin || '') !== String(gate)) return res.status(403).json({ error: 'forbidden' });
+  if (!diagGate(req, res)) return;
   const out = { enabled: maxEnabled(), chatId: MAX_CHAT_ID, polling: maxPollState, acceptedCount: Object.keys(maxAccepted).length };
   try {
     const me = await maxApi('GET', '/me');
@@ -476,10 +467,7 @@ app.get('/max/diag', async (req, res) => {
 
 // Тестовая карточка с кнопкой — проверка канала без реального заказа
 app.post('/max/test', async (req, res) => {
-  const gate = process.env.APP_LOCK_PIN;
-  if (!gate) return res.status(503).json({ error: 'diag_disabled' });
-  const pin = String(req.query.pin || (req.body && req.body.pin) || '');
-  if (pin !== String(gate)) return res.status(403).json({ error: 'forbidden' });
+  if (!diagGate(req, res)) return;
   try {
     await maxApi('POST', '/messages', { chat_id: MAX_CHAT_ID }, {
       text: '🆕 Тестовый заказ № TEST\n\n👤 Тестов Тест Тестович\n📞 +7 000 000-00-00\n📍 Билибино, ул. Тестовая, 1\n💵 Оплата: наличными — взять с клиента 1 250 ₽',
@@ -830,10 +818,9 @@ app.post('/bonus/transaction', async (req, res) => {
 });
 
 // Диагностика конфигурации Альфы (без секретов — только наличие и длины).
-// Защищено кодом замка: /payment/env-check?pin=<APP_LOCK_PIN>
+// Защищено ключом DIAG_KEY: /payment/env-check?pin=<DIAG_KEY>
 app.get('/payment/env-check', (req, res) => {
-  const gate = process.env.APP_LOCK_PIN;
-  if (!gate || String(req.query.pin || '') !== String(gate)) return res.status(403).json({ error: 'forbidden' });
+  if (!diagGate(req, res)) return;
   let b64ok = null, passSrc = 'none', passLen = 0;
   if (process.env.ALFA_PASS_B64) {
     try {
@@ -1395,16 +1382,10 @@ app.post('/auth/email/start', async (req, res) => {
   }
 });
 
-// Диагностика почтовых настроек. Защищено кодом замка: /mail/diag?pin=<APP_LOCK_PIN>
+// Диагностика почтовых настроек. Защищено ключом DIAG_KEY: /mail/diag?pin=<DIAG_KEY>
 // Не отправляет писем — только проверяет соединение с smtp.mail.ru и логин/пароль.
 app.get('/mail/diag', async (req, res) => {
-  const gate = process.env.APP_LOCK_PIN;
-  if (!gate) {
-    return res.status(503).json({ error: 'diag_disabled', hint: 'Задайте APP_LOCK_PIN в переменных Amvera — этот же код будет ключом к диагностике.' });
-  }
-  if (String(req.query.pin || '') !== String(gate)) {
-    return res.status(403).json({ error: 'forbidden' });
-  }
+  if (!diagGate(req, res)) return;
   const userSet = !!process.env.MAIL_USER;
   const passSet = !!process.env.MAIL_PASS;
   if (!userSet || !passSet) {
