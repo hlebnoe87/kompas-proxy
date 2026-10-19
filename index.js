@@ -1407,7 +1407,7 @@ app.get('/mail/diag', async (req, res) => {
   } catch (e) {
     let hint = '';
     if (e && e.responseCode === 535) hint = 'Ящик/пароль отклонены. Для mail.ru нужен «пароль приложения»: Почта → Настройки → Безопасность → Пароли для внешних приложений. Обычный пароль не подойдёт.';
-    else if (e && (e.code === 'ETIMEDOUT' || e.code === 'ECONNREFUSED' || e.code === 'ESOCKET')) hint = 'Нет соединения с smtp.mail.ru:465 — вероятно, хостинг блокирует исходящий SMTP. Напишите в поддержку Amvera.';
+    else if (e && (e.code === 'ETIMEDOUT' || e.code === 'ECONNREFUSED' || e.code === 'ESOCKET')) hint = 'Нет соединения с smtp.mail.ru:465 — хостинг блокирует исходящий SMTP. Напишите в поддержку хостинга с просьбой открыть порт 465.';
     res.json({
       userSet, passSet,
       user: String(process.env.MAIL_USER).replace(/^(.{2}).+(@.+)$/, '$1***$2'),
