@@ -1213,6 +1213,49 @@ app.post('/vk/userinfo', async (req, res) => {
 const nodemailer = require('nodemailer');
 const recoveryAttempts = new Map(); // ip → { n, t } — анти-перебор сброса пароля
 
+// ── ОТПРАВКА ПИСЕМ — два канала ──
+// Основной: HTTP API Unisender (порт 443 — работает даже там, где хостинг
+// блокирует исходящий SMTP). Переменные: UNISENDER_API_KEY,
+// UNISENDER_FROM_EMAIL (подтверждённый отправитель), UNISENDER_FROM_NAME.
+// Запасной: SMTP mail.ru (MAIL_USER/MAIL_PASS) — если Unisender не настроен.
+async function sendAppMail({ to, subject, text, html }) {
+  if (process.env.UNISENDER_API_KEY && process.env.UNISENDER_FROM_EMAIL) {
+    const r = await fetch('https://go1.unisender.ru/ru/transactional/api/v1/email/send.json?api_key=' + encodeURIComponent(process.env.UNISENDER_API_KEY), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({
+        message: {
+          recipients: [{ email: to }],
+          body: { html: html, plaintext: text },
+          subject: subject,
+          from_email: process.env.UNISENDER_FROM_EMAIL,
+          from_name: process.env.UNISENDER_FROM_NAME || 'Компас.Доставка'
+        }
+      }),
+      signal: AbortSignal.timeout(20000)
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.status !== 'success') {
+      throw new Error('Unisender HTTP ' + r.status + ': ' + String(d.message || JSON.stringify(d)).slice(0, 200));
+    }
+    return 'unisender';
+  }
+  if (process.env.MAIL_USER && process.env.MAIL_PASS) {
+    const transporter = nodemailer.createTransport({
+      host: 'smtp.mail.ru', port: 465, secure: true,
+      auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS }
+    });
+    await transporter.sendMail({
+      from: '"Компас.Доставка" <' + process.env.MAIL_USER + '>',
+      to, subject, text, html
+    });
+    return 'smtp';
+  }
+  const err = new Error('Почта не настроена: задайте UNISENDER_API_KEY+UNISENDER_FROM_EMAIL или MAIL_USER+MAIL_PASS');
+  err.code = 'NO_MAIL_CHANNEL';
+  throw err;
+}
+
 app.post('/mail/recovery', async (req, res) => {
   const email   = (req.body.email || '').trim().toLowerCase();
   const agentId = req.body.agentId;
@@ -1268,16 +1311,8 @@ app.post('/mail/recovery', async (req, res) => {
       });
     }
 
-    // Отправляем письмо
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.mail.ru',
-      port: 465,
-      secure: true,
-      auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS }
-    });
-
-    await transporter.sendMail({
-      from: '"Компас.Доставка" <' + process.env.MAIL_USER + '>',
+    // Отправляем письмо (Unisender HTTP API → запасной SMTP)
+    await sendAppMail({
       to: email,
       subject: 'Восстановление доступа — Компас.Доставка',
       text: 'Здравствуйте!\n\nВаш новый пароль для входа в приложение Компас.Доставка:\n\n' + newPass +
@@ -1336,9 +1371,11 @@ app.post('/auth/email/start', async (req, res) => {
       return res.status(400).json({ error: 'Введите корректный email' });
     }
     // Явно сообщаем о не настроенной почте, а не маскируем под общую 500
-    if (!process.env.MAIL_USER || !process.env.MAIL_PASS) {
-      console.error('EMAIL AUTH start: MAIL_USER или MAIL_PASS не заданы в переменных окружения');
-      return res.status(503).json({ error: 'Почтовая служба не настроена на сервере. Используйте вход через ВКонтакте.' });
+    const mailConfigured = (process.env.UNISENDER_API_KEY && process.env.UNISENDER_FROM_EMAIL)
+      || (process.env.MAIL_USER && process.env.MAIL_PASS);
+    if (!mailConfigured) {
+      console.error('EMAIL AUTH start: не заданы UNISENDER_API_KEY/UNISENDER_FROM_EMAIL или MAIL_USER/MAIL_PASS');
+      return res.status(503).json({ error: 'Почтовая служба временно недоступна. Попробуйте позже.' });
     }
     const ip = req.ip || req.connection.remoteAddress || '';
     // Анти-спам: 3 письма на email и 10 писем с IP за 15 минут
@@ -1348,12 +1385,7 @@ app.post('/auth/email/start', async (req, res) => {
     const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
     emailCodes.set(email, { hash: emailCodeHash(email, code), expires: Date.now() + 10 * 60000, attempts: 0 });
 
-    const transporter = nodemailer.createTransport({
-      host: 'smtp.mail.ru', port: 465, secure: true,
-      auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS }
-    });
-    await transporter.sendMail({
-      from: '"Компас.Доставка" <' + process.env.MAIL_USER + '>',
+    const mailChannel = await sendAppMail({
       to: email,
       subject: 'Код входа — Компас.Доставка',
       text: 'Здравствуйте!\n\nВаш код для входа в приложение Компас.Доставка:\n\n' + code +
@@ -1370,7 +1402,7 @@ app.post('/auth/email/start', async (req, res) => {
             '<p style="color:#888;font-size:13px">Если вы не запрашивали код — просто проигнорируйте это письмо.</p>' +
             '</div></div>'
     });
-    console.log('EMAIL AUTH: код отправлен на', email);
+    console.log('EMAIL AUTH: код отправлен на', email, 'канал:', mailChannel);
     res.json({ ok: true });
   } catch(e) {
     console.error('EMAIL AUTH start:', e.message);
@@ -1378,22 +1410,35 @@ app.post('/auth/email/start', async (req, res) => {
     let hint = 'Не удалось отправить письмо. Попробуйте позже.';
     if (e && e.responseCode === 535) hint = 'Почтовый сервер отклонил логин/пароль. Нужен пароль приложения mail.ru.';
     else if (e && (e.code === 'ETIMEDOUT' || e.code === 'ECONNREFUSED' || e.code === 'ESOCKET')) hint = 'Серверу не удаётся подключиться к почте (smtp.mail.ru:465).';
+    else if (e && /Unisender/.test(e.message || '')) hint = 'Сервис отправки писем отклонил запрос. Проверьте UNISENDER_API_KEY и подтверждённый адрес отправителя.';
     res.status(500).json({ error: hint });
   }
 });
 
 // Диагностика почтовых настроек. Защищено ключом DIAG_KEY: /mail/diag?pin=<DIAG_KEY>
-// Не отправляет писем — только проверяет соединение с smtp.mail.ru и логин/пароль.
+// Не отправляет писем. Показывает активный канал: Unisender (HTTP API) или SMTP.
 app.get('/mail/diag', async (req, res) => {
   if (!diagGate(req, res)) return;
+  const uniSet  = !!(process.env.UNISENDER_API_KEY && process.env.UNISENDER_FROM_EMAIL);
   const userSet = !!process.env.MAIL_USER;
   const passSet = !!process.env.MAIL_PASS;
+  if (uniSet) {
+    return res.json({
+      channel: 'unisender',
+      apiKeySet: !!process.env.UNISENDER_API_KEY,
+      fromEmail: String(process.env.UNISENDER_FROM_EMAIL).replace(/^(.{2}).+(@.+)$/, '$1***$2'),
+      fromName: process.env.UNISENDER_FROM_NAME || 'Компас.Доставка',
+      verify: 'configured',
+      hint: 'Основной канал — Unisender HTTP API (порт 443). Проверка отправкой реального письма: запросите код в приложении.'
+    });
+  }
   if (!userSet || !passSet) {
     return res.json({
+      channel: 'none',
       userSet, passSet,
       user: userSet ? String(process.env.MAIL_USER).replace(/^(.{2}).+(@.+)$/, '$1***$2') : null,
       verify: 'not_configured',
-      hint: 'Задайте переменные MAIL_USER (полный адрес ящика) и MAIL_PASS (пароль приложения mail.ru) в настройках Amvera и перезапустите приложение.'
+      hint: 'Задайте UNISENDER_API_KEY + UNISENDER_FROM_EMAIL (рекомендуется) или MAIL_USER + MAIL_PASS (пароль приложения mail.ru) в переменных окружения Timeweb и перезапустите приложение.'
     });
   }
   try {
@@ -1403,12 +1448,13 @@ app.get('/mail/diag', async (req, res) => {
       auth: { user: process.env.MAIL_USER, pass: process.env.MAIL_PASS }
     });
     await t.verify();
-    res.json({ userSet, passSet, user: String(process.env.MAIL_USER).replace(/^(.{2}).+(@.+)$/, '$1***$2'), verify: 'ok' });
+    res.json({ channel: 'smtp', userSet, passSet, user: String(process.env.MAIL_USER).replace(/^(.{2}).+(@.+)$/, '$1***$2'), verify: 'ok' });
   } catch (e) {
     let hint = '';
     if (e && e.responseCode === 535) hint = 'Ящик/пароль отклонены. Для mail.ru нужен «пароль приложения»: Почта → Настройки → Безопасность → Пароли для внешних приложений. Обычный пароль не подойдёт.';
-    else if (e && (e.code === 'ETIMEDOUT' || e.code === 'ECONNREFUSED' || e.code === 'ESOCKET')) hint = 'Нет соединения с smtp.mail.ru:465 — хостинг блокирует исходящий SMTP. Напишите в поддержку хостинга с просьбой открыть порт 465.';
+    else if (e && (e.code === 'ETIMEDOUT' || e.code === 'ECONNREFUSED' || e.code === 'ESOCKET')) hint = 'Нет соединения с smtp.mail.ru:465 — хостинг блокирует исходящий SMTP. Решение без заявок в поддержку: настройте канал Unisender (UNISENDER_API_KEY + UNISENDER_FROM_EMAIL).';
     res.json({
+      channel: 'smtp',
       userSet, passSet,
       user: String(process.env.MAIL_USER).replace(/^(.{2}).+(@.+)$/, '$1***$2'),
       verify: 'error',
