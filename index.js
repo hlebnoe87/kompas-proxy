@@ -613,6 +613,31 @@ const MS_CACHE_TTL = 60 * 1000;
 const MS_CACHEABLE = ['/entity/assortment', '/report/stock', '/entity/discount'];
 const msCache = new Map(); // key → { t, status, body, gz } | { t, pending: Promise }
 
+// ── Справочник единиц измерения МойСклад ──
+// /entity/assortment НЕ раскрывает uom (приходит только meta без name),
+// поэтому без этого справочника все товары выглядят штучными и весовой
+// шаг/счётчик веса ломаются. Справочник маленький — кэшируем на час.
+let uomDict = null, uomDictT = 0;
+async function ensureUomDict() {
+  if (uomDict && Date.now() - uomDictT < 60 * 60 * 1000) return;
+  try {
+    const r = await msFetchLimited(MS_API + '/entity/uom?limit=100', { headers: msAuthHeaders() });
+    const d = await r.json();
+    const map = {};
+    (d.rows || []).forEach(u => {
+      const href = u.meta && u.meta.href;
+      if (href) map[href] = u.name;
+    });
+    if (Object.keys(map).length) { uomDict = map; uomDictT = Date.now(); }
+  } catch(e) { console.warn('uom dict unavailable:', e.message); }
+}
+function uomName(uom) {
+  if (!uom) return undefined;
+  if (uom.name) return uom.name;
+  const href = uom.meta && uom.meta.href;
+  return (uomDict && href && uomDict[href]) || undefined;
+}
+
 // Клиенту из строки ассортимента нужны только эти поля
 function slimAssortRow(p) {
   const o = {
@@ -620,7 +645,8 @@ function slimAssortRow(p) {
     volume: p.volume, weight: p.weight, meta: p.meta
   };
   if (p.productFolder) o.productFolder = { name: p.productFolder.name };
-  if (p.uom)           o.uom = { name: p.uom.name };
+  const un = uomName(p.uom);
+  if (un)                o.uom = { name: un };
   if (p.images) {
     o.images = { meta: p.images.meta };
     // При expand=images отдаём клиенту только ссылку на первую миниатюру —
@@ -722,8 +748,9 @@ app.all('/proxy/*', async (req, res) => {
     };
 
     if (cacheKey) {
-      const pending = doFetch().then(r => {
+      const pending = doFetch().then(async r => {
         if (r.status === 200) {
+          if (path.startsWith('/entity/assortment')) await ensureUomDict();
           const slim = slimMsJson(path, r.body);
           let gz = null;
           try { gz = zlib.gzipSync(slim, { level: 6 }); } catch(e) {}
@@ -1218,6 +1245,7 @@ const recoveryAttempts = new Map(); // ip → { n, t } — анти-перебо
 // блокирует исходящий SMTP). Переменные: UNISENDER_API_KEY,
 // UNISENDER_FROM_EMAIL (подтверждённый отправитель), UNISENDER_FROM_NAME.
 // Запасной: SMTP mail.ru (MAIL_USER/MAIL_PASS) — если Unisender не настроен.
+let lastMailError = null; // последняя ошибка отправки — видна в /mail/diag
 async function sendAppMail({ to, subject, text, html }) {
   if (process.env.UNISENDER_API_KEY && process.env.UNISENDER_FROM_EMAIL) {
     const r = await fetch('https://go1.unisender.ru/ru/transactional/api/v1/email/send.json?api_key=' + encodeURIComponent(process.env.UNISENDER_API_KEY), {
@@ -1236,8 +1264,10 @@ async function sendAppMail({ to, subject, text, html }) {
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.status !== 'success') {
+      lastMailError = new Date().toISOString() + ' Unisender HTTP ' + r.status + ': ' + String(d.message || JSON.stringify(d)).slice(0, 300);
       throw new Error('Unisender HTTP ' + r.status + ': ' + String(d.message || JSON.stringify(d)).slice(0, 200));
     }
+    lastMailError = null;
     return 'unisender';
   }
   if (process.env.MAIL_USER && process.env.MAIL_PASS) {
@@ -1429,7 +1459,8 @@ app.get('/mail/diag', async (req, res) => {
       fromEmail: String(process.env.UNISENDER_FROM_EMAIL).replace(/^(.{2}).+(@.+)$/, '$1***$2'),
       fromName: process.env.UNISENDER_FROM_NAME || 'Компас.Доставка',
       verify: 'configured',
-      hint: 'Основной канал — Unisender HTTP API (порт 443). Проверка отправкой реального письма: запросите код в приложении.'
+      lastError: lastMailError,
+      hint: 'Основной канал — Unisender HTTP API (порт 443). Если lastError не пуст — это точный ответ Unisender о причине отказа.'
     });
   }
   if (!userSet || !passSet) {
