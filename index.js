@@ -989,19 +989,28 @@ async function getAlfaAttrMeta() {
   return _alfaAttrMeta;
 }
 
+// Атрибут «Alfa orderId» хранит значение вида "alfaOrderId|baseAmountKop":
+// baseAmount — сумма заказа БЕЗ буфера холда (+15%), в копейках.
+// Старые заказы хранят просто orderId — base тогда равен 0.
+function parseAlfaAttr(v) {
+  const parts = String(v || '').split('|');
+  return { id: parts[0] || '', base: parseInt(parts[1]) || 0 };
+}
+
 // Приложение клиента вызывает после оплаты — сохраняем alfaOrderId в заказ
 app.post('/payment/save-order-id', async (req, res) => {
   try {
     const msOrderId = req.body.msOrderId, alfaOrderId = req.body.alfaOrderId;
     if (!msOrderId || !alfaOrderId) return res.status(400).json({ error: 'msOrderId и alfaOrderId обязательны' });
+    const baseAmount = Math.round(parseFloat(req.body.baseAmount) || 0); // копейки, без буфера
     const meta = await getAlfaAttrMeta();
     if (!meta) return res.status(500).json({ error: 'attr_not_found' });
     const r = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId, {
       method: 'PUT', headers: msAuthHeaders(true),
-      body: JSON.stringify({ attributes: [{ meta, value: String(alfaOrderId) }] })
+      body: JSON.stringify({ attributes: [{ meta, value: String(alfaOrderId) + (baseAmount > 0 ? '|' + baseAmount : '') }] })
     });
     if (!r.ok) { const t = await r.text(); console.warn('save-order-id MS', r.status, t.slice(0,150)); return res.status(502).json({ error: 'moysklad_' + r.status }); }
-    console.log('Saved alfaOrderId', alfaOrderId, '→ order', msOrderId);
+    console.log('Saved alfaOrderId', alfaOrderId, 'base', baseAmount, '→ order', msOrderId);
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1016,7 +1025,8 @@ app.post('/payment/capture', async (req, res) => {
     const oRes = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId + '?expand=demands', { headers: msAuthHeaders() });
     const order = await oRes.json();
     const attr = (order.attributes || []).find(a => a.name === 'Alfa orderId');
-    const alfaOrderId = attr && attr.value;
+    const parsed = parseAlfaAttr(attr && attr.value);
+    const alfaOrderId = parsed.id;
     if (!alfaOrderId) return res.json({ ok: false, reason: 'no_online_payment' }); // наличные — нечего списывать
     // 2. узнаём удержанную сумму и статус
     const stParams = new URLSearchParams({ orderId: alfaOrderId, ...creds });
@@ -1025,12 +1035,14 @@ app.post('/payment/capture', async (req, res) => {
     });
     const st = await stRes.json();
     const os = st.orderStatus ?? st.OrderStatus;          // устойчиво к регистру поля
-    const amount = parseInt(st.amount ?? st.Amount ?? 0);
+    const amount = parseInt(st.amount ?? st.Amount ?? 0); // холд (с буфером +15% для новых заказов)
     if (os === 2) return res.json({ ok: true, already: true });   // уже списан (идемпотентность)
     if (os !== 1 || !amount) return res.json({ ok: false, reason: 'not_held', status: st });
-    // 3. фактическая сумма списания: холд = товары − бонусы + доставка; если при сборке
-    //    товары заменили/убрали, отгрузка дешевле заказа — уменьшаем списание на разницу,
-    //    остаток холда банк разблокирует автоматически (частичный deposit)
+    // 3. Фактическая сумма списания = база заказа (без буфера) + Δ отгрузки.
+    //    Δ < 0 — сборка дешевле (замена/нет товара): списываем меньше, остаток холда
+    //    банк разблокирует автоматически. Δ > 0 — сборка дороже: списываем больше,
+    //    но НЕ выше холда (буфер +15% покрывает перевес; больше холда банк не даст).
+    //    Заказы без сохранённой базы (старые): база = холд — поведение как раньше.
     let captureAmount = amount;
     try {
       const demands = order.demands || [];
@@ -1043,12 +1055,15 @@ app.post('/payment/capture', async (req, res) => {
       }
       const demandSum = demands.reduce((s, d) => s + (typeof d.sum === 'number' ? d.sum : 0), 0);
       const orderSum = order.sum || 0;
-      if (demandSum > 0 && orderSum > 0 && demandSum < orderSum) {
-        const shortfall = orderSum - demandSum; // копейки
-        captureAmount = Math.max(MIN_PAYMENT, Math.min(amount, amount - shortfall));
-        console.log('CAPTURE частичное: заказ', orderSum, 'отгружено', demandSum, 'холд', amount, '→ списание', captureAmount);
+      const base = parsed.base || amount; // нет базы → холд = база (старые заказы)
+      if (demandSum > 0 && orderSum > 0) {
+        const delta = demandSum - orderSum; // копейки
+        captureAmount = Math.max(MIN_PAYMENT, Math.min(amount, base + delta));
+        if (delta !== 0) console.log('CAPTURE Δ: заказ', orderSum, 'отгружено', demandSum, 'база', base, 'холд', amount, '→ списание', captureAmount);
+      } else if (parsed.base) {
+        captureAmount = Math.max(MIN_PAYMENT, Math.min(amount, base)); // отгрузку не прочитали — списываем базу, буфер отпускаем
       }
-    } catch(e) { console.warn('CAPTURE: не удалось уточнить сумму отгрузки —', e.message, '— списываем полный холд'); }
+    } catch(e) { console.warn('CAPTURE: не удалось уточнить сумму отгрузки —', e.message); captureAmount = Math.max(MIN_PAYMENT, Math.min(amount, parsed.base || amount)); }
     const depParams = new URLSearchParams({ orderId: alfaOrderId, amount: String(captureAmount), ...creds });
     const depRes = await fetch(ALFA_API + '/deposit.do', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: depParams.toString()
@@ -1067,11 +1082,11 @@ app.post('/payment/cancel', async (req, res) => {
     const creds = alfaCredentials();
     const msOrderId = req.body.msOrderId;
     if (!msOrderId) return res.status(400).json({ error: 'msOrderId обязателен' });
-    // alfaOrderId из заказа
+    // alfaOrderId из заказа (атрибут хранит "orderId|baseAmount" — берём id)
     const oRes = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId, { headers: msAuthHeaders() });
     const order = await oRes.json();
     const attr = (order.attributes || []).find(a => a.name === 'Alfa orderId');
-    const alfaOrderId = attr && attr.value;
+    const alfaOrderId = parseAlfaAttr(attr && attr.value).id;
     let payment = { action: 'none', reason: 'no_online_payment' };
     if (alfaOrderId) {
       const stParams = new URLSearchParams({ orderId: alfaOrderId, ...creds });
@@ -1901,7 +1916,7 @@ async function reconcileAbandonedPayments() {
       if (!o.state || o.state.id !== ST_NEW) continue;                       // только «Новый»
       if ((o.description || '').indexOf('Картой онлайн') === -1) continue;  // наличные не трогаем
       const attr = (o.attributes || []).find(a => a.name === 'Alfa orderId');
-      const alfaOrderId = attr && attr.value;
+      const alfaOrderId = parseAlfaAttr(attr && attr.value).id; // формат "orderId|baseAmount"
       if (!alfaOrderId) continue;                                            // платёж не привязан — не рискуем
       const created = Date.parse((o.created || '').replace(' ', 'T') + '+03:00'); // время МС — московское
       const ageMin = created ? (now - created) / 60000 : 0;
