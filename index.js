@@ -390,6 +390,18 @@ async function maxHandleCallback(cb, message) {
     await answer('Заказ уже принят курьером ' + maxAccepted[msOrderId].by);
     return;
   }
+  // Постоплата: нельзя принять заказ до оплаты клиентом (проверяем ДО бронирования)
+  try {
+    const chk = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId + '?expand=state', { headers: msAuthHeaders() });
+    if (chk.ok) {
+      const co = await chk.json();
+      const cst = co.state && co.state.id;
+      if ((co.description || '').indexOf(POSTPAY_MARK) !== -1 && cst !== ST_PAID && cst !== ST_COURIER) {
+        await answer('💳 Заказ ещё не оплачен клиентом — дождитесь оплаты');
+        return;
+      }
+    }
+  } catch(e) { console.warn('MAX accept precheck:', e.message); }
   // Бронируем заказ СРАЗУ (синхронно) — второй клик уже не пройдёт
   maxAccepted[msOrderId] = { by: fio, uid: u.user_id || null, at: Date.now(), msgId: mid || null };
   saveMaxAccepted();
@@ -1146,9 +1158,17 @@ app.post('/order/set-state', async (req, res) => {
 // Общее ядро «курьер принял заказ»: комментарий в МС + уведомление клиенту «В пути».
 // Телефон может быть пустым — у MAX-профиля курьера телефона нет.
 async function acceptOrderCore(msOrderId, courierName, courierPhone) {
-  const oRes = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId + '?expand=agent', { headers: msAuthHeaders() });
+  const oRes = await msFetchLimited(MS_API + '/entity/customerorder/' + msOrderId + '?expand=agent,state', { headers: msAuthHeaders() });
   if (!oRes.ok) { const t = await oRes.text(); console.warn('accept read MS', oRes.status, t.slice(0,150)); return { ok: false, error: 'moysklad_' + oRes.status }; }
   const order = await oRes.json();
+  // Постоплата: заказ с пометкой «Онлайн после сборки» курьер может принять
+  // ТОЛЬКО после оплаты клиентом (статус «Оплачен онлайн»). Иначе заказ уехал бы
+  // до оплаты — а при постоплате деньги списываются на этапе «заказ собран».
+  const stId = order.state && order.state.id;
+  if ((order.description || '').indexOf(POSTPAY_MARK) !== -1 && stId !== ST_PAID && stId !== ST_COURIER) {
+    console.warn('ACCEPT rejected (postpay not paid):', order.name);
+    return { ok: false, error: 'not_paid' };
+  }
   // дописываем курьера в комментарий (прежнюю строку курьера, если была, заменяем)
   const baseDesc = (order.description || '').replace(/^🛵 Курьер:.*(\r?\n)?/m, '').trim();
   const courierLine = '🛵 Курьер: ' + courierName + (courierPhone ? ' | ' + courierPhone : '');
@@ -1796,7 +1816,7 @@ function stageFromStateName(name) {
   if (s.includes('доставлен') || s.includes('выполнен') || s.includes('завершён')) return 4;
   if (s.includes('пути') || s.includes('доставка') || s.includes('курьер')) return 3;
   if (s.includes('сбор')) return 2;
-  if (s.includes('подтвердить оплату')) return 5;  // внутренняя стадия — не уведомляем
+  if (s.includes('подтвердить оплату')) return 5;  // постоплата: собран — ждёт оплаты
   if (s.includes('принят') || s.includes('новый')) return 1;
   return -1;
 }
@@ -1806,6 +1826,8 @@ const ORDER_MSG = {
   2: num => `🛒 Заказ ${num} собирается на складе.`,
   // 3 (В пути) НЕ шлём из наблюдателя — уведомление с контактами курьера уходит при принятии заказа (/order/accept)
   4: num => `✓ Заказ ${num} доставлен. Спасибо, что выбрали Компас.Доставку! 💚`,
+  // Постоплата: заказ собран — просим оплатить (кнопка «Оплатить» уже в корзине приложения)
+  5: num => `💳 Заказ ${num} собран! Откройте корзину в приложении и оплатите заказ — курьер выедет сразу после оплаты.`,
   0: num => `❌ Заказ ${num} отменён. Если это ошибка — напишите нам.`,
   6: num => `↩️ По заказу ${num} оформлен возврат.`,
 };
@@ -1892,6 +1914,11 @@ maxPollLoop(); // MAX-бот: слушаем нажатия «Принять з�
 const ST_NEW        = '6b950fea-02a8-11ed-0a80-073c00232c38';
 const ST_AUTHORIZED = 'beee8bc0-5a0d-11f1-0a80-1ae90004ebf1';
 const ST_PAID       = 'bef10ed6-5a0d-11f1-0a80-1ae90004ebf4';
+// Постоплата: «Подтвердить оплату» — заказ собран, ждёт оплаты клиентом
+const ST_CONFIRM_PAY = 'c97e6308-5f8e-11f1-0a80-10ed00018c22';
+// Метка постоплаты в описании заказа (НЕ содержит «Картой онлайн» — иначе
+// сборщик и табло скрывали бы такие заказы как неоплаченные)
+const POSTPAY_MARK = 'Онлайн после сборки';
 async function msSetOrderState(orderId, stateId) {
   const r = await msFetchLimited(MS_API + '/entity/customerorder/' + orderId, {
     method: 'PUT', headers: msAuthHeaders(true),
@@ -1913,8 +1940,45 @@ async function reconcileAbandonedPayments() {
     const rows = (await r.json()).rows || [];
     const now = Date.now();
     for (const o of rows) {
-      if (!o.state || o.state.id !== ST_NEW) continue;                       // только «Новый»
-      if ((o.description || '').indexOf('Картой онлайн') === -1) continue;  // наличные не трогаем
+      const stId = o.state && o.state.id;
+      const desc = o.description || '';
+
+      // ── ПОСТОПЛАТА: заказ собран и ждёт оплаты («Подтвердить оплату») ──
+      // Клиент мог оплатить и не вернуться в приложение — сверяемся с банком
+      if (stId === ST_CONFIRM_PAY) {
+        const attr = (o.attributes || []).find(a => a.name === 'Alfa orderId');
+        const alfaOrderId = parseAlfaAttr(attr && attr.value).id;
+        if (!alfaOrderId) continue; // клиент ещё не нажимал «Оплатить» — ждём
+        const stRes = await fetch(ALFA_API + '/getOrderStatusExtended.do', {
+          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ orderId: alfaOrderId, ...creds }).toString()
+        });
+        const st = await stRes.json();
+        const os = st.orderStatus ?? st.OrderStatus;
+        if (os === 2) { // одностадийная оплата прошла — отмечаем, дальше сработает передача курьеру
+          await msSetOrderState(o.id, ST_PAID);
+          console.log('POSTPAY paid:', o.name, '→ PAID');
+        }
+        // os 0/3/6 — платёж не состоялся: клиент может нажать «Оплатить» ещё раз,
+        // заказ НЕ отменяем автоматически (он уже собран, товар списан отгрузкой)
+        continue;
+      }
+
+      // ── ПОСТОПЛАТА: оплаченный собранный заказ автоматически уходит курьеру ──
+      if (stId === ST_PAID && desc.indexOf(POSTPAY_MARK) !== -1) {
+        // Страховка: передаём курьеру только если есть отгрузка (заказ точно собран)
+        try {
+          const od = await (await msFetchLimited(MS_API + '/entity/customerorder/' + o.id + '?expand=demands', { headers: msAuthHeaders() })).json();
+          if (od && (od.demands || []).length) {
+            await msSetOrderState(o.id, ST_COURIER);
+            console.log('POSTPAY handoff:', o.name, '→ COURIER');
+          }
+        } catch(e) { console.warn('POSTPAY handoff check:', o.name, e.message); }
+        continue;
+      }
+
+      if (stId !== ST_NEW) continue;                                         // только «Новый»
+      if (desc.indexOf('Картой онлайн') === -1) continue;                    // наличные и постоплату не трогаем
       const attr = (o.attributes || []).find(a => a.name === 'Alfa orderId');
       const alfaOrderId = parseAlfaAttr(attr && attr.value).id; // формат "orderId|baseAmount"
       if (!alfaOrderId) continue;                                            // платёж не привязан — не рискуем
