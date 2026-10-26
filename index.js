@@ -1955,9 +1955,17 @@ async function reconcileAbandonedPayments() {
         });
         const st = await stRes.json();
         const os = st.orderStatus ?? st.OrderStatus;
-        if (os === 2) { // одностадийная оплата прошла — отмечаем, дальше сработает передача курьеру
+        if (os === 2) { // одностадийная оплата прошла — отмечаем и СРАЗУ передаём курьеру,
+          // не дожидаясь следующего цикла (иначе заказ минуту «висит» в «Оплачен онлайн»)
           await msSetOrderState(o.id, ST_PAID);
           console.log('POSTPAY paid:', o.name, '→ PAID');
+          try {
+            const od = await (await msFetchLimited(MS_API + '/entity/customerorder/' + o.id + '?expand=demands', { headers: msAuthHeaders() })).json();
+            if (od && (od.demands || []).length) {
+              await msSetOrderState(o.id, ST_COURIER);
+              console.log('POSTPAY handoff:', o.name, '→ COURIER');
+            }
+          } catch(e) { console.warn('POSTPAY handoff check:', o.name, e.message); }
         }
         // os 0/3/6 — платёж не состоялся: клиент может нажать «Оплатить» ещё раз,
         // заказ НЕ отменяем автоматически (он уже собран, товар списан отгрузкой)
