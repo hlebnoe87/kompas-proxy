@@ -848,7 +848,10 @@ app.post('/bonus/transaction', async (req, res) => {
     const txt = await r.text();
     if (!r.ok) {
       console.error('bonustransaction error:', r.status, txt.slice(0, 400));
-      return res.status(r.status).json({ error: 'bonustransaction HTTP ' + r.status });
+      // Отдаём текст ошибки МойСклад наружу — иначе 412 диагностируется вслепую
+      let msMsg = '';
+      try { msMsg = (JSON.parse(txt).errors || []).map(e => e.error).filter(Boolean).join('; '); } catch(e) {}
+      return res.status(r.status).json({ error: 'bonustransaction HTTP ' + r.status, msError: msMsg || txt.slice(0, 300) });
     }
     res.json({ ok: true });
   } catch (e) {
