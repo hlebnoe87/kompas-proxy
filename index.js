@@ -1226,22 +1226,88 @@ app.post('/addr/suggest', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Проксирование изображений МоегоСклада ──
+// ── Проксирование изображений МоегоСклада с дисковым кэшем ──
+// Каждое фото скачивается из МойСклад ровно один раз, дальше отдаём с диска.
+// При одновременных запросах одного фото — склеиваем их в одну загрузку.
+const fsMini   = require('fs');
+const fspMini  = require('fs/promises');
+const pathMini = require('path');
+const cryptoMini = require('crypto');
+const MINI_CACHE_DIR = process.env.MINI_CACHE_DIR || pathMini.join(process.cwd(), 'miniature-cache');
+const MINI_CACHE_MAX_BYTES = 500 * 1024 * 1024; // 500 МБ на кэш фото
+try { fsMini.mkdirSync(MINI_CACHE_DIR, { recursive: true }); } catch (e) {}
+const miniPending = new Map(); // key → Promise загрузки (защита от дублей)
+
+// LRU-очистка: если кэш разросся — удаляем самые старые файлы
+async function miniCacheCleanup() {
+  try {
+    const names = (await fspMini.readdir(MINI_CACHE_DIR)).filter(n => !n.endsWith('.json'));
+    const items = [];
+    let total = 0;
+    for (const n of names) {
+      try {
+        const st = await fspMini.stat(pathMini.join(MINI_CACHE_DIR, n));
+        items.push({ n, size: st.size, mtime: st.mtimeMs });
+        total += st.size;
+      } catch (e) {}
+    }
+    if (total <= MINI_CACHE_MAX_BYTES) return;
+    items.sort((a, b) => a.mtime - b.mtime);
+    for (const it of items) {
+      if (total <= MINI_CACHE_MAX_BYTES * 0.8) break;
+      await fspMini.unlink(pathMini.join(MINI_CACHE_DIR, it.n)).catch(() => {});
+      await fspMini.unlink(pathMini.join(MINI_CACHE_DIR, it.n + '.json')).catch(() => {});
+      total -= it.size;
+    }
+  } catch (e) {}
+}
+setInterval(miniCacheCleanup, 60 * 60 * 1000).unref();
+miniCacheCleanup();
+
 app.get('/miniature/*', async (req, res) => {
   const path  = req.path.replace('/miniature', '');
   const query = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
+  const key  = cryptoMini.createHash('sha1').update(path + query).digest('hex');
+  const file = pathMini.join(MINI_CACHE_DIR, key);
+  const meta = file + '.json';
+
+  // 1) Попытка отдать из дискового кэша
+  try {
+    const buf = await fspMini.readFile(file);
+    let ct = 'image/jpeg';
+    try { ct = JSON.parse(await fspMini.readFile(meta, 'utf8')).ct || ct; } catch (e) {}
+    res.set('Content-Type', ct);
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.set('X-Cache', 'HIT');
+    fspMini.utimes(file, new Date(), new Date()).catch(() => {}); // обновить LRU-метку
+    res.send(buf);
+    return;
+  } catch (e) { /* промах кэша — идём в МойСклад */ }
+
+  // 2) Загрузка из МойСклад (одновременные запросы того же фото склеиваются)
   const imgUrl = 'https://miniature-prod.moysklad.ru' + path + query;
   try {
-    // ВАЖНО: downloadHref миниатюр — публичная ссылка. Сервис миниатюр МойСклад
-    // отвечает 400 на любой запрос С заголовком Authorization — не добавляем его.
-    const response = await fetch(imgUrl);
-    if (!response.ok) { res.status(response.status).send(''); return; }
-    const buffer = await response.buffer();
-    res.set('Content-Type', response.headers.get('content-type') || 'image/jpeg');
+    if (!miniPending.has(key)) {
+      const p = (async () => {
+        // ВАЖНО: downloadHref миниатюр — публичная ссылка. Сервис миниатюр МойСклад
+        // отвечает 400 на любой запрос С заголовком Authorization — не добавляем его.
+        const response = await fetch(imgUrl);
+        if (!response.ok) { const err = new Error('upstream'); err.status = response.status; throw err; }
+        const buffer = await response.buffer();
+        const ct = response.headers.get('content-type') || 'image/jpeg';
+        fspMini.writeFile(file, buffer).catch(() => {});
+        fspMini.writeFile(meta, JSON.stringify({ ct })).catch(() => {});
+        return { buffer, ct };
+      })().finally(() => miniPending.delete(key));
+      miniPending.set(key, p);
+    }
+    const { buffer, ct } = await miniPending.get(key);
+    res.set('Content-Type', ct);
     res.set('Cache-Control', 'public, max-age=86400');
+    res.set('X-Cache', 'MISS');
     res.send(buffer);
-  } catch(e) {
-    res.status(500).send('');
+  } catch (e) {
+    res.status(e.status || 500).send('');
   }
 });
 
