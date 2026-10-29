@@ -1238,6 +1238,32 @@ const MINI_CACHE_MAX_BYTES = 500 * 1024 * 1024; // 500 МБ на кэш фото
 try { fsMini.mkdirSync(MINI_CACHE_DIR, { recursive: true }); } catch (e) {}
 const miniPending = new Map(); // key → Promise загрузки (защита от дублей)
 
+// ── Слой памяти: LRU-кэш фото в RAM (главный ускоритель; диск — резерв) ──
+const MINI_MEM_MAX_BYTES = 150 * 1024 * 1024; // до 150 МБ в памяти
+const miniMem = new Map(); // key → { buf, ct, t, size }
+let miniMemBytes = 0;
+function miniMemSet(key, buf, ct) {
+  const size = buf.length;
+  if (size > MINI_MEM_MAX_BYTES / 4) return; // гигантов не кэшируем в RAM
+  const old = miniMem.get(key);
+  if (old) miniMemBytes -= old.size;
+  miniMem.set(key, { buf, ct, t: Date.now(), size });
+  miniMemBytes += size;
+  // Вытесняем самые старые, пока не влезем в лимит
+  if (miniMemBytes > MINI_MEM_MAX_BYTES) {
+    const byAge = [...miniMem.entries()].sort((a, b) => a[1].t - b[1].t);
+    for (const [k, v] of byAge) {
+      if (miniMemBytes <= MINI_MEM_MAX_BYTES * 0.8) break;
+      miniMem.delete(k); miniMemBytes -= v.size;
+    }
+  }
+}
+// Ошибки записи на диск — в лог (видно в консоли Timeweb), но не роняем ответы
+let _miniDiskErrShown = 0;
+function miniDiskErr(where, e) {
+  if (_miniDiskErrShown < 5) { _miniDiskErrShown++; console.error('[mini-cache] диск недоступен (' + where + '):', e && e.message); }
+}
+
 // LRU-очистка: если кэш разросся — удаляем самые старые файлы
 async function miniCacheCleanup() {
   try {
@@ -1271,20 +1297,32 @@ app.get('/miniature/*', async (req, res) => {
   const file = pathMini.join(MINI_CACHE_DIR, key);
   const meta = file + '.json';
 
-  // 1) Попытка отдать из дискового кэша
+  // 1) Память — самый быстрый слой (работает всегда, даже если диск недоступен)
+  const memHit = miniMem.get(key);
+  if (memHit) {
+    memHit.t = Date.now(); // LRU-метка
+    res.set('Content-Type', memHit.ct);
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.set('X-Cache', 'MEM');
+    res.send(memHit.buf);
+    return;
+  }
+
+  // 2) Диск — переживает перезапуск контейнера
   try {
     const buf = await fspMini.readFile(file);
     let ct = 'image/jpeg';
     try { ct = JSON.parse(await fspMini.readFile(meta, 'utf8')).ct || ct; } catch (e) {}
+    miniMemSet(key, buf, ct);
     res.set('Content-Type', ct);
     res.set('Cache-Control', 'public, max-age=86400');
-    res.set('X-Cache', 'HIT');
+    res.set('X-Cache', 'DISK');
     fspMini.utimes(file, new Date(), new Date()).catch(() => {}); // обновить LRU-метку
     res.send(buf);
     return;
   } catch (e) { /* промах кэша — идём в МойСклад */ }
 
-  // 2) Загрузка из МойСклад (одновременные запросы того же фото склеиваются)
+  // 3) Загрузка из МойСклад (одновременные запросы того же фото склеиваются)
   const imgUrl = 'https://miniature-prod.moysklad.ru' + path + query;
   try {
     if (!miniPending.has(key)) {
@@ -1295,8 +1333,9 @@ app.get('/miniature/*', async (req, res) => {
         if (!response.ok) { const err = new Error('upstream'); err.status = response.status; throw err; }
         const buffer = await response.buffer();
         const ct = response.headers.get('content-type') || 'image/jpeg';
-        fspMini.writeFile(file, buffer).catch(() => {});
-        fspMini.writeFile(meta, JSON.stringify({ ct })).catch(() => {});
+        miniMemSet(key, buffer, ct);
+        fspMini.writeFile(file, buffer).catch(e => miniDiskErr('write img', e));
+        fspMini.writeFile(meta, JSON.stringify({ ct })).catch(e => miniDiskErr('write meta', e));
         return { buffer, ct };
       })().finally(() => miniPending.delete(key));
       miniPending.set(key, p);
