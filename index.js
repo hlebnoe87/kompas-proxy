@@ -836,9 +836,10 @@ app.post('/bonus/transaction', async (req, res) => {
       agent:        { meta: { href: MS_API + '/entity/counterparty/' + agentId, type: 'counterparty', mediaType: 'application/json' } },
       bonusProgram: { meta: progMeta },
       bonusValue:   v,
-      transactionType: type === 'spend' ? 'SPENDING' : 'EARNING',
-      executionDate: msDateTimeNow()
+      transactionType: type === 'spend' ? 'SPENDING' : 'EARNING'
     };
+    // executionDate допустима только у начисления (EARNING) — у списания МойСклад её отклоняет (412)
+    if (type !== 'spend') body.executionDate = msDateTimeNow();
     if (orderId) {
       body.parentDocument = { meta: { href: MS_API + '/entity/customerorder/' + orderId, type: 'customerorder', mediaType: 'application/json' } };
     }
