@@ -836,7 +836,7 @@ app.post('/bonus/transaction', async (req, res) => {
       agent:        { meta: { href: MS_API + '/entity/counterparty/' + agentId, type: 'counterparty', mediaType: 'application/json' } },
       bonusProgram: { meta: progMeta },
       bonusValue:   v,
-      transactionType: type === 'spend' ? 'Списание' : 'Начисление',
+      transactionType: type === 'spend' ? 'SPENDING' : 'EARNING',
       executionDate: msDateTimeNow()
     };
     if (orderId) {
@@ -854,6 +854,31 @@ app.post('/bonus/transaction', async (req, res) => {
       return res.status(r.status).json({ error: 'bonustransaction HTTP ' + r.status, msError: msMsg || txt.slice(0, 300) });
     }
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message || e) });
+  }
+});
+
+// ── ПРОМО «Первый заказ — бесплатная доставка»: серверная проверка ──
+// Клиентская проверка по localStorage ненадёжна (другое устройство, переустановка,
+// устаревшая кэшированная версия приложения). Здесь — истина из МойСклад.
+// GET /promo/first-order?agentId=<uuid>&excludeId=<uuid заказа, который не считаем>
+// Отменённые заказы промо НЕ сжигают.
+app.get('/promo/first-order', async (req, res) => {
+  const agentId   = String(req.query.agentId || '').trim();
+  const excludeId = String(req.query.excludeId || '').trim();
+  if (!/^[0-9a-f-]{36}$/i.test(agentId)) return res.status(400).json({ error: 'agentId required' });
+  try {
+    const r = await msFetchLimited(MS_API + '/entity/customerorder?limit=100&expand=state&filter=' +
+      encodeURIComponent('agent=' + MS_API + '/entity/counterparty/' + agentId), { headers: msAuthHeaders() });
+    if (!r.ok) return res.status(r.status).json({ error: 'customerorder HTTP ' + r.status });
+    const rows = (await r.json()).rows || [];
+    const real = rows.filter(o => {
+      if (excludeId && o.id === excludeId) return false;
+      const st = (o.state && o.state.name) || '';
+      return !/отмен/i.test(st);
+    });
+    res.json({ first: real.length === 0, counted: real.length });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
   }
