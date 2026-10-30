@@ -840,9 +840,10 @@ app.post('/bonus/transaction', async (req, res) => {
     };
     // executionDate допустима только у начисления (EARNING) — у списания МойСклад её отклоняет (412)
     if (type !== 'spend') body.executionDate = msDateTimeNow();
-    if (orderId) {
-      body.parentDocument = { meta: { href: MS_API + '/entity/customerorder/' + orderId, type: 'customerorder', mediaType: 'application/json' } };
-    }
+    // ВАЖНО: parentDocument у bonustransaction принимает только retaildemand/
+    // retailsalesreturn (розничные продажи). Наш заказ — customerorder: привязка
+    // к нему даёт HTTP 400 и операция молча не проходит. Поэтому orderId от клиента
+    // принимаем (совместимость), но в МойСклад НЕ передаём.
     const r = await msFetchLimited(MS_API + '/entity/bonustransaction', {
       method: 'POST', headers: msAuthHeaders(true), body: JSON.stringify(body)
     });
