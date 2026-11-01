@@ -922,6 +922,22 @@ app.get('/payment/env-check', (req, res) => {
   });
 });
 
+// ── Карта привязки платежей: msOrderId → { alfaOrderId, formUrl, ts } ──
+// Решает проблему «клиент открыл оплату дважды»: повторный заход возвращает
+// ТОТ ЖЕ платёж, а не регистрирует новый (иначе клиент оплачивает «вторую»
+// страницу, а приложение следит за первой — оплата не фиксируется).
+// Хранится на диске рядом с прокси — переживает рестарт.
+const PAYMAP_FILE = __dirname + '/paymap.json';
+let payMap = {};
+try { payMap = JSON.parse(fs.readFileSync(PAYMAP_FILE, 'utf8')); } catch(e) { payMap = {}; }
+function payMapSave() { try { fs.writeFileSync(PAYMAP_FILE, JSON.stringify(payMap)); } catch(e) {} }
+function payMapPrune() {
+  const cut = Date.now() - 86400000; // записи старше суток не нужны
+  let changed = false;
+  for (const k in payMap) { if (!payMap[k] || !payMap[k].ts || payMap[k].ts < cut) { delete payMap[k]; changed = true; } }
+  if (changed) payMapSave();
+}
+
 // ── Альфа-Банк: регистрация платежа ──
 app.post('/payment/register.do', async (req, res) => {
   try {
@@ -932,13 +948,48 @@ app.post('/payment/register.do', async (req, res) => {
       console.warn('PAYMENT invalid amount:', amount);
       return res.status(400).json({ error: 'Invalid amount' });
     }
-    const params = new URLSearchParams({ ...req.body, ...creds });
+    const msOrderId = req.body.msOrderId ? String(req.body.msOrderId) : '';
+    payMapPrune();
+
+    // Повторный заход в оплату того же заказа МойСклад: сначала смотрим,
+    // что стало с прошлой регистрацией
+    if (msOrderId && payMap[msOrderId]) {
+      const prev = payMap[msOrderId];
+      try {
+        const stRes = await fetch(ALFA_API + '/getOrderStatusExtended.do', {
+          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ orderId: prev.alfaOrderId, ...creds }).toString()
+        });
+        const st = await stRes.json();
+        const os = st.orderStatus ?? st.OrderStatus;
+        if (os === 1 || os === 2) {
+          // Клиент уже оплатил (возможно, с «другой» страницы) — сообщаем приложению
+          console.log('PAYMENT already paid:', msOrderId, '→', prev.alfaOrderId);
+          return res.json({ alreadyPaid: true, orderId: prev.alfaOrderId });
+        }
+        if (os === 0 && prev.formUrl) {
+          // Платёж жив и не оплачен — отдаём ТУ ЖЕ платёжную страницу
+          console.log('PAYMENT reuse:', msOrderId, '→', prev.alfaOrderId);
+          return res.json({ orderId: prev.alfaOrderId, formUrl: prev.formUrl, reused: true });
+        }
+        // os 3/6/прочее — сессия истекла/отклонена: проваливаемся ниже и регистрируем новый
+      } catch(e) { console.warn('PAYMENT reuse check:', e.message); }
+    }
+
+    // msOrderId — наш служебный параметр, Альфе он не нужен
+    const fwd = { ...req.body };
+    delete fwd.msOrderId;
+    const params = new URLSearchParams({ ...fwd, ...creds });
     console.log('PAYMENT register:', req.body.orderNumber, amount);
     const response = await fetch(ALFA_API + '/register.do', {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString()
     });
     const data = await response.json();
     console.log('PAYMENT result:', data.errorCode || 'OK');
+    if (msOrderId && data.orderId && data.formUrl && String(data.errorCode || '0') === '0') {
+      payMap[msOrderId] = { alfaOrderId: data.orderId, formUrl: data.formUrl, ts: Date.now() };
+      payMapSave();
+    }
     res.json(data);
   } catch(e) {
     res.status(500).json({ error: e.message });
@@ -1052,6 +1103,11 @@ app.post('/payment/save-order-id', async (req, res) => {
       body: JSON.stringify({ attributes: [{ meta, value: String(alfaOrderId) + (baseAmount > 0 ? '|' + baseAmount : '') }] })
     });
     if (!r.ok) { const t = await r.text(); console.warn('save-order-id MS', r.status, t.slice(0,150)); return res.status(502).json({ error: 'moysklad_' + r.status }); }
+    // Дублируем привязку в карту платежей: сторож смотрит и в атрибут, и в карту
+    if (!payMap[msOrderId] || payMap[msOrderId].alfaOrderId !== String(alfaOrderId)) {
+      payMap[msOrderId] = { alfaOrderId: String(alfaOrderId), formUrl: (payMap[msOrderId] && payMap[msOrderId].formUrl) || null, ts: Date.now() };
+      payMapSave();
+    }
     console.log('Saved alfaOrderId', alfaOrderId, 'base', baseAmount, '→ order', msOrderId);
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -2083,14 +2139,27 @@ async function reconcileAbandonedPayments() {
       if (stId === ST_CONFIRM_PAY) {
         const attr = (o.attributes || []).find(a => a.name === 'Alfa orderId');
         const alfaOrderId = parseAlfaAttr(attr && attr.value).id;
-        if (!alfaOrderId) continue; // клиент ещё не нажимал «Оплатить» — ждём
-        const stRes = await fetch(ALFA_API + '/getOrderStatusExtended.do', {
-          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ orderId: alfaOrderId, ...creds }).toString()
-        });
-        const st = await stRes.json();
-        const os = st.orderStatus ?? st.OrderStatus;
-        if (os === 2) { // одностадийная оплата прошла — отмечаем и СРАЗУ передаём курьеру,
+        // Проверяем ВСЕ известные платежи заказа: и привязанный в атрибуте,
+        // и последний из карты регистраций — клиент мог открыть оплату дважды
+        // и оплатить «не ту» страницу (атрибут тогда смотрит на протухший платёж)
+        const idsToCheck = [];
+        if (alfaOrderId) idsToCheck.push(alfaOrderId);
+        const mapEntry = payMap[o.id];
+        if (mapEntry && mapEntry.alfaOrderId && idsToCheck.indexOf(mapEntry.alfaOrderId) === -1) idsToCheck.push(mapEntry.alfaOrderId);
+        if (!idsToCheck.length) continue; // клиент ещё не нажимал «Оплатить» — ждём
+        let paidAny = false;
+        for (const pid of idsToCheck) {
+          try {
+            const stRes = await fetch(ALFA_API + '/getOrderStatusExtended.do', {
+              method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body: new URLSearchParams({ orderId: pid, ...creds }).toString()
+            });
+            const st = await stRes.json();
+            const os = st.orderStatus ?? st.OrderStatus;
+            if (os === 2) { paidAny = true; break; }
+          } catch(e) { console.warn('POSTPAY status check', pid, e.message); }
+        }
+        if (paidAny) { // одностадийная оплата прошла — отмечаем и СРАЗУ передаём курьеру,
           // не дожидаясь следующего цикла (иначе заказ минуту «висит» в «Оплачен онлайн»)
           await msSetOrderState(o.id, ST_PAID);
           console.log('POSTPAY paid:', o.name, '→ PAID');
@@ -2102,7 +2171,7 @@ async function reconcileAbandonedPayments() {
             }
           } catch(e) { console.warn('POSTPAY handoff check:', o.name, e.message); }
         }
-        // os 0/3/6 — платёж не состоялся: клиент может нажать «Оплатить» ещё раз,
+        // платёж не состоялся: клиент может нажать «Оплатить» ещё раз,
         // заказ НЕ отменяем автоматически (он уже собран, товар списан отгрузкой)
         continue;
       }
