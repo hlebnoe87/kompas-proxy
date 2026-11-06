@@ -2273,5 +2273,249 @@ app.post('/sborka/login', (req, res) => {
   res.status(401).json({ error: 'Неверный PIN-код' });
 });
 
+/* ── ПУБЛИЧНЫЙ ПРАЙС-ЛИСТ ──────────────────────────────────────────────
+   /price/catalog — названия и актуальные цены, кэш 60 секунд.
+   /price/stock   — только признак наличия на складе «Компас.Доставка», кэш 10 секунд.
+   Запросы посетителей НЕ идут напрямую в МойСклад: отдаётся готовый снапшот,
+   а обновление выполняется в фоне одним процессом (in-flight дедупликация).
+   При сбое МойСклад продолжаем отдавать последний корректный снапшот.
+   ?v=<version> — если версия не изменилась, ответ 304 без тела (экономит трафик). */
+const PRICE_STORE_ID = process.env.PRICE_STORE_ID || '6b6acb8d-02a8-11ed-0a80-073c00232c14';
+const PRICE_TYPE_ID = process.env.PRICE_TYPE_ID || '6b6b9d45-02a8-11ed-0a80-073c00232c1a';
+const PRICE_MS_API = (process.env.MS_API_BASE || MS_API).replace(/\/+$/, '');
+const PRICE_CATALOG_TTL = Math.max(15000, parseInt(process.env.PRICE_CATALOG_TTL_MS || '60000', 10));
+const PRICE_STOCK_TTL = Math.max(1000, parseInt(process.env.PRICE_STOCK_TTL_MS || '10000', 10));
+const PRICE_SNAPSHOT_FILE = process.env.PRICE_SNAPSHOT_FILE ||
+  (fs.existsSync('/data') ? '/data/price-snapshot.json' : __dirname + '/price-snapshot.json');
+let priceCatalogCache = null;
+let priceStockCache = null;
+let priceCatalogPending = null;
+let priceStockPending = null;
+let priceCatalogError = '';
+let priceStockError = '';
+
+function priceVersion(data) {
+  return crypto.createHash('sha1').update(JSON.stringify(data)).digest('hex').slice(0, 16);
+}
+function priceWrap(payload) {
+  const body = JSON.stringify(payload);
+  let gz = null;
+  try { gz = zlib.gzipSync(body, { level: 6 }); } catch(e) {}
+  return { payload, body, gz };
+}
+function pricePersist() {
+  try {
+    const data = JSON.stringify({
+      catalog: priceCatalogCache && priceCatalogCache.payload,
+      stock: priceStockCache && priceStockCache.payload
+    });
+    const tmp = PRICE_SNAPSHOT_FILE + '.tmp';
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, PRICE_SNAPSHOT_FILE);
+  } catch(e) { console.warn('PRICE snapshot save:', e.message); }
+}
+try {
+  const saved = JSON.parse(fs.readFileSync(PRICE_SNAPSHOT_FILE, 'utf8'));
+  if (saved.catalog && Array.isArray(saved.catalog.items) && saved.catalog.version) {
+    priceCatalogCache = priceWrap(saved.catalog);
+  }
+  if (saved.stock && saved.stock.items && typeof saved.stock.items === 'object' && saved.stock.version) {
+    priceStockCache = priceWrap(saved.stock);
+  }
+  console.log('PRICE snapshot loaded:', priceCatalogCache ? priceCatalogCache.payload.items.length : 0, 'items');
+} catch(e) {}
+
+async function priceMsPage(path, offset) {
+  const sep = path.includes('?') ? '&' : '?';
+  const url = PRICE_MS_API + path + sep + 'limit=1000&offset=' + (offset || 0);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 25000);
+  try {
+    const r = await msFetchLimited(url, { headers: msAuthHeaders(), signal: ctrl.signal });
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error('МойСклад HTTP ' + r.status + ': ' + text.slice(0, 120));
+    }
+    return r.json();
+  } finally { clearTimeout(timer); }
+}
+async function priceMsAll(path) {
+  const first = await priceMsPage(path, 0);
+  const rows = (first.rows || []).slice();
+  const total = (first.meta && first.meta.size) || rows.length;
+  const offsets = [];
+  for (let offset = 1000; offset < total; offset += 1000) offsets.push(offset);
+  // Не более двух тяжёлых страниц параллельно; общий лимитер МойСклад тоже действует.
+  for (let i = 0; i < offsets.length; i += 2) {
+    const parts = await Promise.all(offsets.slice(i, i + 2).map(offset => priceMsPage(path, offset)));
+    parts.forEach(part => rows.push(...(part.rows || [])));
+  }
+  return rows;
+}
+function priceHrefId(meta) {
+  return ((meta && meta.href) || '').split('/').pop().split('?')[0];
+}
+function priceUuid(meta) {
+  const uuid = ((meta && meta.uuidHref) || '').split('id=').pop().split('?')[0];
+  return uuid || priceHrefId(meta);
+}
+function priceSaleMap(rows) {
+  const map = {};
+  (rows || []).forEach(d => {
+    if (d.active === false || d.allProducts) return;
+    const items = Array.isArray(d.assortment) ? d.assortment : [];
+    if (!items.length) return;
+    let percent = parseFloat(d.discount != null ? d.discount : d.discountPercent) || 0;
+    if (!percent) {
+      const m = (d.name || '').match(/(\d+)\s*%/);
+      if (m) percent = parseFloat(m[1]);
+    }
+    const special = d.specialPrice && (d.specialPrice.value || 0) > 0 ? d.specialPrice.value / 100 : 0;
+    items.forEach(a => {
+      const id = priceHrefId(a.meta);
+      const uuid = priceUuid(a.meta);
+      [id, uuid].filter(Boolean).forEach(key => {
+        if (!map[key] || percent > map[key].percent) map[key] = { percent, special };
+      });
+    });
+  });
+  return map;
+}
+async function priceLoadCatalog() {
+  const [assortment, discounts] = await Promise.all([
+    priceMsAll('/entity/assortment?expand=productFolder,salePrices,salePrices.priceType'),
+    priceMsAll('/entity/discount')
+  ]);
+  const saleMap = priceSaleMap(discounts);
+  const items = [];
+  assortment.forEach(p => {
+    if (p.archived === true || (p.meta && p.meta.type === 'service')) return;
+    const id = priceUuid(p.meta);
+    const hrefId = priceHrefId(p.meta) || id;
+    if (!id) return;
+    let name = String(p.name || '').trim();
+    (p.attributes || []).forEach(a => {
+      if (a.name === 'Название для приложения' && String(a.value || '').trim()) {
+        name = String(a.value).trim();
+      }
+    });
+    if (!name) return;
+    let price = 0;
+    if (Array.isArray(p.salePrices) && p.salePrices.length) {
+      const retail = p.salePrices.find(sp => priceHrefId(sp.priceType && sp.priceType.meta) === PRICE_TYPE_ID) || p.salePrices[0];
+      price = (retail.value || 0) / 100;
+    }
+    const discount = saleMap[hrefId] || saleMap[id];
+    if (discount && price > 0) {
+      const discounted = discount.special > 0 ? discount.special :
+        (discount.percent > 0 ? Math.round(price * (1 - discount.percent / 100)) : 0);
+      if (discounted > 0 && discounted < price) price = discounted;
+    }
+    items.push({ id, hrefId, name, sourceName: String(p.name || name), price: Math.round(price * 100) / 100 });
+  });
+  if (!items.length) throw new Error('МойСклад вернул пустой каталог');
+  items.sort((a, b) => a.name.localeCompare(b.name, 'ru', { sensitivity: 'base' }));
+  return items;
+}
+async function priceLoadStock() {
+  const rows = await priceMsAll('/report/stock/bystore');
+  const quantities = {};
+  rows.forEach(row => {
+    const storeRow = (row.stockByStore || []).find(s => priceHrefId(s.meta) === PRICE_STORE_ID);
+    const qty = storeRow ? Math.max(0, parseFloat(storeRow.stock) || 0) : 0;
+    [priceUuid(row.meta), priceHrefId(row.meta)].filter(Boolean).forEach(id => {
+      quantities[id] = (quantities[id] || 0) + qty;
+    });
+    const name = String(row.name || '');
+    if (name) quantities['name:' + name] = (quantities['name:' + name] || 0) + qty;
+  });
+  const items = {};
+  Object.keys(quantities).forEach(id => { items[id] = quantities[id] > 0; });
+  return items;
+}
+function priceRefresh(kind, force) {
+  const isCatalog = kind === 'catalog';
+  let cache = isCatalog ? priceCatalogCache : priceStockCache;
+  let pending = isCatalog ? priceCatalogPending : priceStockPending;
+  const ttl = isCatalog ? PRICE_CATALOG_TTL : PRICE_STOCK_TTL;
+  if (!force && cache && Date.now() - cache.payload.checkedAt < ttl) return Promise.resolve();
+  if (pending) return pending;
+  pending = (async () => {
+    const items = isCatalog ? await priceLoadCatalog() : await priceLoadStock();
+    const version = priceVersion(items);
+    const now = Date.now();
+    cache = isCatalog ? priceCatalogCache : priceStockCache;
+    if (cache && cache.payload.version === version) {
+      // Данные не изменились: версия остаётся, клиенты продолжат получать 304.
+      cache.payload.checkedAt = now;
+    } else {
+      const payload = {
+        version,
+        updatedAt: new Date(now).toISOString(),
+        checkedAt: now,
+        items
+      };
+      if (isCatalog) priceCatalogCache = priceWrap(payload);
+      else priceStockCache = priceWrap(payload);
+      pricePersist();
+      console.log('PRICE', kind, 'updated:', version, 'entries:', Array.isArray(items) ? items.length : Object.keys(items).length);
+    }
+    if (isCatalog) priceCatalogError = '';
+    else priceStockError = '';
+  })().catch(e => {
+    // Важно: старый кэш НЕ очищаем — посетители не увидят пустую страницу.
+    if (isCatalog) priceCatalogError = e.message;
+    else priceStockError = e.message;
+    console.warn('PRICE', kind, 'refresh failed:', e.message);
+  }).finally(() => {
+    if (isCatalog) priceCatalogPending = null;
+    else priceStockPending = null;
+  });
+  if (isCatalog) priceCatalogPending = pending;
+  else priceStockPending = pending;
+  return pending;
+}
+async function priceSend(req, res, kind) {
+  const isCatalog = kind === 'catalog';
+  let cache = isCatalog ? priceCatalogCache : priceStockCache;
+  const refreshing = priceRefresh(kind, false);
+  if (!cache) {
+    // Только самый первый холодный запрос ждёт коротко; дальше работает снапшот.
+    await Promise.race([refreshing, msSleep(12000)]);
+    cache = isCatalog ? priceCatalogCache : priceStockCache;
+  }
+  if (!cache) {
+    res.header('Retry-After', '3');
+    return res.status(503).json({ error: 'price_warming', message: 'Прайс обновляется, повторите через несколько секунд' });
+  }
+  if (req.query.v && String(req.query.v) === cache.payload.version) {
+    return res.status(304).end();
+  }
+  res.header('Cache-Control', 'no-store');
+  res.header('Content-Type', 'application/json; charset=utf-8');
+  res.header('Vary', 'Accept-Encoding');
+  if (cache.gz && clientAcceptsGzip(req)) {
+    return res.header('Content-Encoding', 'gzip').send(cache.gz);
+  }
+  return res.send(cache.body);
+}
+app.get('/price/catalog', (req, res) => priceSend(req, res, 'catalog'));
+app.get('/price/stock', (req, res) => priceSend(req, res, 'stock'));
+app.get('/price/health', (req, res) => res.json({
+  ok: !!(priceCatalogCache && priceStockCache),
+  catalogCount: priceCatalogCache ? priceCatalogCache.payload.items.length : 0,
+  stockCount: priceStockCache ? Object.keys(priceStockCache.payload.items).length : 0,
+  catalogVersion: priceCatalogCache && priceCatalogCache.payload.version,
+  stockVersion: priceStockCache && priceStockCache.payload.version,
+  catalogError: priceCatalogError || null,
+  stockError: priceStockError || null,
+  store: 'Компас.Доставка'
+}));
+// Фоновые часы: TTL проверяется каждые 3 секунды, сами данные обновляются реже.
+setInterval(() => { priceRefresh('catalog', false); }, 3000);
+setInterval(() => { priceRefresh('stock', false); }, 3000);
+priceRefresh('catalog', true);
+priceRefresh('stock', true);
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Kompas Proxy running on port ' + PORT));
