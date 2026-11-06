@@ -2411,6 +2411,7 @@ async function priceLoadCatalog() {
       const retail = p.salePrices.find(sp => priceHrefId(sp.priceType && sp.priceType.meta) === PRICE_TYPE_ID) || p.salePrices[0];
       price = (retail.value || 0) / 100;
     }
+    const originalPrice = price;
     const discount = saleMap[hrefId] || saleMap[id];
     if (discount && price > 0) {
       const discounted = discount.special > 0 ? discount.special :
@@ -2419,6 +2420,7 @@ async function priceLoadCatalog() {
     }
     items.push({
       id, hrefId, name, sourceName: String(p.name || ''), category, subcategory,
+      originalPrice: Math.round(originalPrice * 100) / 100,
       price: Math.round(price * 100) / 100,
       discountPercent: discount ? discount.percent : 0,
       discountName: discount ? discount.name : ''
