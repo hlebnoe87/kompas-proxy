@@ -2375,7 +2375,7 @@ function priceSaleMap(rows) {
       const id = priceHrefId(a.meta);
       const uuid = priceUuid(a.meta);
       [id, uuid].filter(Boolean).forEach(key => {
-        if (!map[key] || percent > map[key].percent) map[key] = { percent, special };
+        if (!map[key] || percent > map[key].percent) map[key] = { percent, special, name: String(d.name || '') };
       });
     });
   });
@@ -2417,7 +2417,12 @@ async function priceLoadCatalog() {
         (discount.percent > 0 ? Math.round(price * (1 - discount.percent / 100)) : 0);
       if (discounted > 0 && discounted < price) price = discounted;
     }
-    items.push({ id, hrefId, name, sourceName: String(p.name || ''), category, subcategory, price: Math.round(price * 100) / 100 });
+    items.push({
+      id, hrefId, name, sourceName: String(p.name || ''), category, subcategory,
+      price: Math.round(price * 100) / 100,
+      discountPercent: discount ? discount.percent : 0,
+      discountName: discount ? discount.name : ''
+    });
   });
   if (!items.length) throw new Error('МойСклад вернул пустой каталог');
   items.sort((a, b) => a.name.localeCompare(b.name, 'ru', { sensitivity: 'base' }));
