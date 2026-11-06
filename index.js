@@ -2393,13 +2393,19 @@ async function priceLoadCatalog() {
     const id = priceUuid(p.meta);
     const hrefId = priceHrefId(p.meta) || id;
     if (!id) return;
-    let name = String(p.name || '').trim();
+    // Публичный прайс использует только заполненное «Название для приложения».
+    // Складское сокращённое наименование не подставляем даже как временный fallback.
+    let name = '';
     (p.attributes || []).forEach(a => {
       if (a.name === 'Название для приложения' && String(a.value || '').trim()) {
-        name = String(a.value).trim();
+        name = String(a.value).replace(/\s+/g, ' ').trim();
       }
     });
     if (!name) return;
+    const categoryPath = String(p.pathName || (p.productFolder && p.productFolder.pathName) || '')
+      .split('/').map(part => part.trim()).filter(Boolean);
+    const category = categoryPath[0] || 'Без категории';
+    const subcategory = categoryPath.slice(1).join(' → ');
     let price = 0;
     if (Array.isArray(p.salePrices) && p.salePrices.length) {
       const retail = p.salePrices.find(sp => priceHrefId(sp.priceType && sp.priceType.meta) === PRICE_TYPE_ID) || p.salePrices[0];
@@ -2411,7 +2417,7 @@ async function priceLoadCatalog() {
         (discount.percent > 0 ? Math.round(price * (1 - discount.percent / 100)) : 0);
       if (discounted > 0 && discounted < price) price = discounted;
     }
-    items.push({ id, hrefId, name, sourceName: String(p.name || name), price: Math.round(price * 100) / 100 });
+    items.push({ id, hrefId, name, sourceName: String(p.name || ''), category, subcategory, price: Math.round(price * 100) / 100 });
   });
   if (!items.length) throw new Error('МойСклад вернул пустой каталог');
   items.sort((a, b) => a.name.localeCompare(b.name, 'ru', { sensitivity: 'base' }));
