@@ -83,7 +83,9 @@ app.put('/bot-relay/state/:name', (req, res) => {
     return res.status(403).json({ ok: false, error: 'state_not_allowed' });
   }
   try {
-    const text = req.body.toString('utf8');
+    const text = Buffer.isBuffer(req.body)
+      ? req.body.toString('utf8')
+      : (typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
     const parsed = JSON.parse(text);
     if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('object_required');
     fsBot.mkdirSync(BOT_STATE_DIR, { recursive: true });
