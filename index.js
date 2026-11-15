@@ -1,6 +1,101 @@
 const express = require('express');
 const fetch   = require('node-fetch');
+const fsBot   = require('fs');
 const app     = express();
+
+/* ── ЗАЩИЩЁННЫЙ КАНАЛ ДЛЯ ОБЛАЧНЫХ БОТОВ ──
+   Telegram-токен чат-бота остаётся только на этом сервере. Отдельный ключ
+   BOT_RELAY_KEY защищает relay и файлы состояния от публичного доступа.
+   Маршруты не пересекаются со старым TG_BOT_TOKEN (вход в приложение). */
+const BOT_STATE_DIR = process.env.BOT_STATE_DIR ||
+  (fsBot.existsSync('/data') ? '/data/bot-state' : __dirname + '/.bot-state');
+const BOT_STATE_FILES = new Set(['support_state.json', 'tg_support_state.json']);
+const TG_RELAY_METHODS = new Set([
+  'getMe', 'getUpdates', 'setMyCommands', 'sendMessage', 'editMessageText',
+  'sendMediaGroup', 'answerCallbackQuery'
+]);
+
+app.use('/bot-relay', express.raw({ type: '*/*', limit: '20mb' }));
+
+function botRelayAllowed(req, res) {
+  const expected = process.env.BOT_RELAY_KEY;
+  if (!expected) {
+    res.status(503).json({ ok: false, error: 'relay_not_configured' });
+    return false;
+  }
+  if (req.get('x-bot-relay-key') !== expected) {
+    res.status(403).json({ ok: false, error: 'forbidden' });
+    return false;
+  }
+  return true;
+}
+
+app.get('/bot-relay/health', (req, res) => {
+  if (!botRelayAllowed(req, res)) return;
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, telegramConfigured: !!process.env.TG_SHOP_BOT_TOKEN });
+});
+
+app.post('/bot-relay/telegram/:method', async (req, res) => {
+  if (!botRelayAllowed(req, res)) return;
+  const method = req.params.method;
+  const token = process.env.TG_SHOP_BOT_TOKEN;
+  if (!token) return res.status(503).json({ ok: false, error: 'telegram_not_configured' });
+  if (!TG_RELAY_METHODS.has(method)) {
+    return res.status(403).json({ ok: false, error: 'method_not_allowed' });
+  }
+  try {
+    const response = await fetch('https://api.telegram.org/bot' + token + '/' + method, {
+      method: 'POST',
+      headers: { 'Content-Type': req.get('content-type') || 'application/json' },
+      body: req.body && req.body.length ? req.body : '{}',
+      signal: AbortSignal.timeout(method === 'getUpdates' ? 45000 : 50000)
+    });
+    const body = await response.text();
+    res.status(response.status)
+      .set('Cache-Control', 'no-store')
+      .type(response.headers.get('content-type') || 'application/json')
+      .send(body);
+  } catch (e) {
+    console.error('TG shop relay:', method, e.message);
+    res.status(502).json({ ok: false, error: 'telegram_upstream_unavailable' });
+  }
+});
+
+function botStatePath(name) {
+  return BOT_STATE_DIR + '/' + name;
+}
+
+app.get('/bot-relay/state/:name', (req, res) => {
+  if (!botRelayAllowed(req, res)) return;
+  if (!BOT_STATE_FILES.has(req.params.name)) {
+    return res.status(403).json({ ok: false, error: 'state_not_allowed' });
+  }
+  res.set('Cache-Control', 'no-store');
+  const file = botStatePath(req.params.name);
+  if (!fsBot.existsSync(file)) return res.status(404).json({ ok: false, error: 'not_found' });
+  res.type('application/json').send(fsBot.readFileSync(file, 'utf8'));
+});
+
+app.put('/bot-relay/state/:name', (req, res) => {
+  if (!botRelayAllowed(req, res)) return;
+  if (!BOT_STATE_FILES.has(req.params.name)) {
+    return res.status(403).json({ ok: false, error: 'state_not_allowed' });
+  }
+  try {
+    const text = req.body.toString('utf8');
+    const parsed = JSON.parse(text);
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('object_required');
+    fsBot.mkdirSync(BOT_STATE_DIR, { recursive: true });
+    const file = botStatePath(req.params.name);
+    const tmp = file + '.tmp';
+    fsBot.writeFileSync(tmp, JSON.stringify(parsed), { mode: 0o600 });
+    fsBot.renameSync(tmp, file);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(400).json({ ok: false, error: 'invalid_state' });
+  }
+});
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
