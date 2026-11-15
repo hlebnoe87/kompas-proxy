@@ -95,6 +95,7 @@ app.put('/bot-relay/state/:name', (req, res) => {
     fsBot.renameSync(tmp, file);
     res.json({ ok: true });
   } catch (e) {
+    console.error('Bot state PUT failed:', e.code || 'parse', e.message);
     res.status(400).json({ ok: false, error: 'invalid_state' });
   }
 });
