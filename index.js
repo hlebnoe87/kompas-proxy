@@ -1,110 +1,15 @@
 const express = require('express');
 const fetch   = require('node-fetch');
-const fsBot   = require('fs');
 const app     = express();
 
-/* ── ЗАЩИЩЁННЫЙ КАНАЛ ДЛЯ ОБЛАЧНЫХ БОТОВ ──
-   Telegram-токен чат-бота остаётся только на этом сервере. Отдельный ключ
-   BOT_RELAY_KEY защищает relay и файлы состояния от публичного доступа.
-   Маршруты не пересекаются со старым TG_BOT_TOKEN (вход в приложение). */
-const BOT_STATE_DIR = process.env.BOT_STATE_DIR ||
-  (fsBot.existsSync('/data') ? '/data/bot-state' : __dirname + '/.bot-state');
-const BOT_STATE_FILES = new Set(['support_state.json', 'tg_support_state.json']);
-const TG_RELAY_METHODS = new Set([
-  'getMe', 'getUpdates', 'setMyCommands', 'sendMessage', 'editMessageText',
-  'sendMediaGroup', 'answerCallbackQuery'
-]);
-
-app.use('/bot-relay', express.raw({ type: '*/*', limit: '20mb' }));
-
-function botRelayAllowed(req, res) {
-  const expected = process.env.BOT_RELAY_KEY;
-  if (!expected) {
-    res.status(503).json({ ok: false, error: 'relay_not_configured' });
-    return false;
-  }
-  if (req.get('x-bot-relay-key') !== expected) {
-    res.status(403).json({ ok: false, error: 'forbidden' });
-    return false;
-  }
-  return true;
-}
-
-app.get('/bot-relay/health', (req, res) => {
-  if (!botRelayAllowed(req, res)) return;
-  res.set('Cache-Control', 'no-store');
-  res.json({ ok: true, telegramConfigured: !!process.env.TG_SHOP_BOT_TOKEN });
-});
-
-app.post('/bot-relay/telegram/:method', async (req, res) => {
-  if (!botRelayAllowed(req, res)) return;
-  const method = req.params.method;
-  const token = process.env.TG_SHOP_BOT_TOKEN;
-  if (!token) return res.status(503).json({ ok: false, error: 'telegram_not_configured' });
-  if (!TG_RELAY_METHODS.has(method)) {
-    return res.status(403).json({ ok: false, error: 'method_not_allowed' });
-  }
-  try {
-    const response = await fetch('https://api.telegram.org/bot' + token + '/' + method, {
-      method: 'POST',
-      headers: { 'Content-Type': req.get('content-type') || 'application/json' },
-      body: req.body && req.body.length ? req.body : '{}',
-      signal: AbortSignal.timeout(method === 'getUpdates' ? 45000 : 50000)
-    });
-    const body = await response.text();
-    res.status(response.status)
-      .set('Cache-Control', 'no-store')
-      .type(response.headers.get('content-type') || 'application/json')
-      .send(body);
-  } catch (e) {
-    console.error('TG shop relay:', method, e.message);
-    res.status(502).json({ ok: false, error: 'telegram_upstream_unavailable' });
-  }
-});
-
-function botStatePath(name) {
-  return BOT_STATE_DIR + '/' + name;
-}
-
-app.get('/bot-relay/state/:name', (req, res) => {
-  if (!botRelayAllowed(req, res)) return;
-  if (!BOT_STATE_FILES.has(req.params.name)) {
-    return res.status(403).json({ ok: false, error: 'state_not_allowed' });
-  }
-  res.set('Cache-Control', 'no-store');
-  const file = botStatePath(req.params.name);
-  if (!fsBot.existsSync(file)) return res.status(404).json({ ok: false, error: 'not_found' });
-  res.type('application/json').send(fsBot.readFileSync(file, 'utf8'));
-});
-
-app.put('/bot-relay/state/:name', (req, res) => {
-  if (!botRelayAllowed(req, res)) return;
-  if (!BOT_STATE_FILES.has(req.params.name)) {
-    return res.status(403).json({ ok: false, error: 'state_not_allowed' });
-  }
-  try {
-    const text = Buffer.isBuffer(req.body)
-      ? req.body.toString('utf8')
-      : (typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
-    const parsed = JSON.parse(text);
-    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('object_required');
-    fsBot.mkdirSync(BOT_STATE_DIR, { recursive: true });
-    const file = botStatePath(req.params.name);
-    const tmp = file + '.tmp';
-    fsBot.writeFileSync(tmp, JSON.stringify(parsed), { mode: 0o600 });
-    fsBot.renameSync(tmp, file);
-    res.json({ ok: true });
-  } catch (e) {
-    console.error('Bot state PUT failed:', e.code || 'parse', e.message);
-    res.status(400).json({ ok: false, error: 'invalid_state' });
-  }
-});
+// Timeweb проксирует запросы: без этого все клиенты имеют IP reverse proxy,
+// а ограничения попыток входа и запросов работают неправильно. Если число
+// промежуточных proxy отличается, задайте TRUST_PROXY_HOPS в окружении.
+const configuredProxyHops = Number.parseInt(process.env.TRUST_PROXY_HOPS || '1', 10);
+app.set('trust proxy', Number.isInteger(configuredProxyHops) && configuredProxyHops >= 0 ? configuredProxyHops : 1);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
-// Health-check для Amvera: корень должен отдавать 200 (раньше был 404 → проба не проходила)
-app.get('/', (req, res) => res.json({ ok: true, service: 'kompas-proxy' }));
 
 // ── Безопасность: CORS только с разрешённых доменов ──
 const ALLOWED_ORIGINS = ['https://kompas87.ru', 'https://www.kompas87.ru'];
@@ -124,37 +29,116 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── АВАРИЙНЫЙ РЕЖИМ БЕЗОПАСНОСТИ ──
+// Старые маршруты не проверяют владельца заказа и роль сотрудника. Пока они не
+// заменены на авторизованные API, наружу оставляем только публичный каталог,
+// остатки, изображения и прайс. НЕ отключать этот режим на боевом сервере:
+// SECURITY_LOCKDOWN=0 предназначен исключительно для локального тестирования.
+// Основной пакет работает в совместимом режиме: приём заказов НЕ останавливается.
+// Аварийный lockdown сохранён отдельно вне деплойной папки. Здесь он будет
+// заменён на поэтапное закрытие legacy после перевода клиентов на защищённые API.
+const SECURITY_LOCKDOWN = false;
+const PUBLIC_PROXY_PATHS = new Set([
+  '/entity/assortment',
+  '/entity/discount',
+  '/report/stock/bystore',
+]);
+const PUBLIC_PRODUCT_IMAGES = /^\/entity\/product\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/images$/i;
+function validPublicInteger(params, name, min, max) {
+  const values = params.getAll(name);
+  if (!values.length) return true;
+  if (values.length !== 1 || !/^\d+$/.test(values[0])) return false;
+  const value = Number(values[0]);
+  return Number.isSafeInteger(value) && value >= min && value <= max;
+}
+function isPublicProxyRead(req) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+  if (!req.path.startsWith('/proxy/')) return false;
+  const path = req.path.slice('/proxy'.length);
+  const isImages = PUBLIC_PRODUCT_IMAGES.test(path);
+  if (!PUBLIC_PROXY_PATHS.has(path) && !isImages) return false;
+
+  // Не даём подставлять произвольные filter/search/expand и создавать бесконечное
+  // число тяжёлых cache-miss запросов к МойСклад. Разрешены только параметры,
+  // которые реально использует текущий публичный каталог.
+  const rawUrl = String(req.originalUrl || req.url || req.path);
+  const queryPos = rawUrl.indexOf('?');
+  const params = new URLSearchParams(queryPos >= 0 ? rawUrl.slice(queryPos + 1) : '');
+  const allowedKeys = isImages ? ['limit'] : (path === '/entity/assortment' ? ['limit', 'offset', 'expand'] : ['limit', 'offset']);
+  for (const key of params.keys()) if (!allowedKeys.includes(key)) return false;
+  if (!validPublicInteger(params, 'limit', 1, 1000)) return false;
+  if (!validPublicInteger(params, 'offset', 0, 1000000)) return false;
+  if (params.has('expand') && (params.getAll('expand').length !== 1 ||
+      params.get('expand') !== 'productFolder,salePrices,salePrices.priceType')) return false;
+  return true;
+}
+app.use((req, res, next) => {
+  res.set({
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+    'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+    'Strict-Transport-Security': 'max-age=31536000',
+    'Cross-Origin-Resource-Policy': 'cross-origin',
+  });
+  if (!SECURITY_LOCKDOWN) return next();
+  const isPublic = req.path === '/' || req.path.startsWith('/price/') ||
+    req.path.startsWith('/miniature/') || isPublicProxyRead(req);
+  if (isPublic) return next();
+  res.set('Cache-Control', 'no-store');
+  return res.status(403).json({
+    error: 'security_lockdown',
+    message: 'Операция временно недоступна во время обновления защиты. Каталог и прайс продолжают работать.',
+  });
+});
+if (SECURITY_LOCKDOWN) console.warn('SECURITY LOCKDOWN: включён — заказы, оплата, бонусы и рабочие API закрыты');
+
+// Health-check объявлен ПОСЛЕ общего middleware, чтобы получать те же заголовки.
+app.get('/', (req, res) => res.json({ ok: true, service: 'kompas-proxy' }));
+
 // ── Rate limiting: защита от злоупотреблений ──
 // Лимит 1000/мин: фотографии товаров грузятся сотнями запросов за сессию,
 // прежние 200/мин резали их (HTTP 429) и ломали загрузку фото и каталога.
 // /miniature/* (картинки, кэшируются браузером на сутки) вообще не считаем.
 const rateLimitMap = new Map();
+const RATE_WINDOW_MS = 60000;
+const RATE_MAX_PER_IP = 1000;
+setInterval(() => {
+  const cutoff = Date.now() - RATE_WINDOW_MS;
+  for (const [ip, times] of rateLimitMap) {
+    const active = times.filter(t => t >= cutoff);
+    if (active.length) rateLimitMap.set(ip, active);
+    else rateLimitMap.delete(ip);
+  }
+}, RATE_WINDOW_MS).unref(); // не даём Map бесконечно накапливать старые IP
 app.use((req, res, next) => {
   if (req.path.startsWith('/miniature/')) return next();
   const ip  = req.ip || req.connection.remoteAddress;
   const now = Date.now();
-  const windowMs = 60000;
-  const max = 1000;
   if (!rateLimitMap.has(ip)) rateLimitMap.set(ip, []);
-  const requests = rateLimitMap.get(ip).filter(t => now - t < windowMs);
+  const requests = rateLimitMap.get(ip).filter(t => now - t < RATE_WINDOW_MS);
   requests.push(now);
   rateLimitMap.set(ip, requests);
-  if (requests.length > max) return res.status(429).json({ error: 'Too many requests' });
+  if (requests.length > RATE_MAX_PER_IP) {
+    res.set('Retry-After', '60');
+    return res.status(429).json({ error: 'Too many requests' });
+  }
   next();
 });
 
 // ── Код-замок приложения УДАЛЁН (19.10.2026) ──
 // Приложение открывается свободно, эндпоинты /app-lock/* больше не существуют.
-// Диагностические эндпоинты (/mail/diag, /max/diag, /max/test, /payment/env-check)
-// защищены отдельным ключом DIAG_KEY из переменных окружения Amvera.
+// Диагностические эндпоинты защищены DIAG_KEY из переменных окружения.
+// Ключ принимаем только в заголовке: query-параметр попадает в историю и логи URL.
 function diagGate(req, res) {
   const key = process.env.DIAG_KEY;
   if (!key) {
-    res.status(503).json({ error: 'diag_disabled', hint: 'Задайте DIAG_KEY в переменных Amvera — этот ключ будет паролем к диагностике (?pin=...).' });
+    res.status(503).json({ error: 'diag_disabled' });
     return false;
   }
-  const pin = String(req.query.pin || (req.body && req.body.pin) || '');
-  if (pin !== String(key)) { res.status(403).json({ error: 'forbidden' }); return false; }
+  const supplied = String(req.get('x-diag-key') || '');
+  if (supplied !== String(key)) { res.status(403).json({ error: 'forbidden' }); return false; }
   return true;
 }
 
@@ -340,7 +324,9 @@ function agentIdFromOrder(o) {
 // курьером ФИО», клиенту — «В пути» (общее ядро acceptOrderCore).
 // Callback-кнопки принимаем long polling'ом (GET /updates) — публичный вебхук
 // и открытый входящий порт не нужны, работает из любого контейнера.
-const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN || 'f9LHodD0cOIUSFxiRPZi4Iq1lmuUQWO8XY6qqd4rEfKUU5hDZ2krtuKLMLH33ftoahR3IPAcWNAcO8VqBIRk';
+// Токен задаётся только в защищённых переменных окружения. Ранее встроенное
+// значение считается скомпрометированным и должно быть перевыпущено в MAX.
+const MAX_BOT_TOKEN = process.env.MAX_BOT_TOKEN || '';
 const MAX_CHAT_ID   = process.env.MAX_CHAT_ID   || '-79168565055513'; // канал «Компас.Курьеры»
 const MAX_API       = 'https://botapi.max.ru';
 function maxEnabled() { return !!MAX_BOT_TOKEN && !!MAX_CHAT_ID; }
@@ -780,7 +766,7 @@ function slimAssortRow(p) {
 function slimStockRow(r) {
   return {
     name: r.name, meta: r.meta,
-    stockByStore: (r.stockByStore || []).map(s => ({ meta: s.meta, stock: s.stock }))
+    stockByStore: (r.stockByStore || []).map(s => ({ meta: s.meta, stock: s.stock, reserve: s.reserve }))
   };
 }
 // Оставляем в ответе только нужное клиенту (6 МБ → ~1.5 МБ до сжатия)
@@ -849,7 +835,9 @@ app.all('/proxy/*', async (req, res) => {
     if (req.method === 'POST' || req.method === 'PUT') headers['Content-Type'] = 'application/json';
     const options = { method: req.method, headers };
     if ((req.method === 'POST' || req.method === 'PUT') && req.body) options.body = JSON.stringify(req.body);
-    console.log(req.method, msUrl);
+    // Query может содержать телефон, email или адрес в filter/search — в логи
+    // пишем только метод и путь, без персональных данных и параметров.
+    console.log('MS proxy:', req.method, path);
 
     const doFetch = async () => {
       const response = await msFetchLimited(msUrl, options);
@@ -1393,7 +1381,8 @@ app.post('/order/accept', async (req, res) => {
 // Заодно снимаем зависимость от доступности suggestions.dadata.ru из сети клиента.
 app.post('/addr/suggest', async (req, res) => {
   try {
-    const token = process.env.DADATA_TOKEN || 'c8d5cda7926f8a95bb054cb8517439bd57f45261';
+    const token = process.env.DADATA_TOKEN;
+    if (!token) return res.status(503).json({ error: 'dadata_not_configured' });
     const query = String((req.body && req.body.query) || '').trim().slice(0, 120);
     if (query.length < 2) return res.json({ suggestions: [] });
     const r = await fetch('https://suggestions.dadata.ru/suggestions/api/4_1/rs/suggest/address', {
@@ -1471,6 +1460,39 @@ async function miniCacheCleanup() {
 setInterval(miniCacheCleanup, 60 * 60 * 1000).unref();
 miniCacheCleanup();
 
+const MINI_DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024;
+const MINI_DOWNLOAD_TIMEOUT_MS = 15000;
+async function fetchMiniWithLimits(url) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), MINI_DOWNLOAD_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { signal: ctrl.signal });
+    if (!response.ok) { const err = new Error('upstream'); err.status = response.status; throw err; }
+    const declaredSize = Number(response.headers.get('content-length') || 0);
+    if (declaredSize > MINI_DOWNLOAD_MAX_BYTES) { const err = new Error('image_too_large'); err.status = 413; throw err; }
+    const ct = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (!ct.startsWith('image/')) { const err = new Error('not_an_image'); err.status = 502; throw err; }
+    // Читаем поток с ограничением: response.buffer() раньше позволял ответу без
+    // Content-Length занять неограниченный объём памяти процесса.
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of response.body) {
+      size += chunk.length;
+      if (size > MINI_DOWNLOAD_MAX_BYTES) {
+        response.body.destroy();
+        const err = new Error('image_too_large'); err.status = 413; throw err;
+      }
+      chunks.push(chunk);
+    }
+    return { buffer: Buffer.concat(chunks, size), ct };
+  } catch (e) {
+    if (e && e.name === 'AbortError') e.status = 504;
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 app.get('/miniature/*', async (req, res) => {
   const path  = req.path.replace('/miniature', '');
   const query = req.url.includes('?') ? req.url.substring(req.url.indexOf('?')) : '';
@@ -1510,10 +1532,7 @@ app.get('/miniature/*', async (req, res) => {
       const p = (async () => {
         // ВАЖНО: downloadHref миниатюр — публичная ссылка. Сервис миниатюр МойСклад
         // отвечает 400 на любой запрос С заголовком Authorization — не добавляем его.
-        const response = await fetch(imgUrl);
-        if (!response.ok) { const err = new Error('upstream'); err.status = response.status; throw err; }
-        const buffer = await response.buffer();
-        const ct = response.headers.get('content-type') || 'image/jpeg';
+        const { buffer, ct } = await fetchMiniWithLimits(imgUrl);
         miniMemSet(key, buffer, ct);
         fspMini.writeFile(file, buffer).catch(e => miniDiskErr('write img', e));
         fspMini.writeFile(meta, JSON.stringify({ ct })).catch(e => miniDiskErr('write meta', e));
@@ -1697,6 +1716,184 @@ app.post('/mail/recovery', async (req, res) => {
 // 2) /auth/email/verify — сверяем код, ищем контрагента по email в МойСклад.
 //    Код никогда не покидает сервер, в ответе — только ok и данные клиента.
 const crypto = require('crypto');
+
+// ── СЕРВЕРНЫЕ СЕССИИ v2 ──
+// В ответ клиенту уходит случайный токен один раз; в файле хранится только его
+// SHA-256. Старые клиенты продолжают работать на этапе совместимости, а новые
+// API никогда не принимают agentId/роль как доказательство личности.
+const SESSION_STORE = process.env.SESSION_STORE || (fs.existsSync('/data') ? '/data/kompas-sessions.json' : './kompas-sessions.json');
+const SESSION_CUSTOMER_TTL = 30 * 24 * 3600 * 1000;
+const SESSION_STAFF_TTL = 12 * 3600 * 1000;
+let appSessions = Object.create(null);
+try {
+  const saved = JSON.parse(fs.readFileSync(SESSION_STORE, 'utf8') || '{}');
+  if (saved && typeof saved === 'object' && !Array.isArray(saved)) appSessions = saved;
+} catch (e) {}
+function sessionHash(token) { return crypto.createHash('sha256').update(String(token || '')).digest('hex'); }
+function saveAppSessions() {
+  try {
+    const tmp = SESSION_STORE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(appSessions), { mode: 0o600 });
+    fs.renameSync(tmp, SESSION_STORE);
+  } catch (e) { console.error('SESSION store:', e.message); }
+}
+function pruneAppSessions() {
+  const now = Date.now();
+  for (const [hash, s] of Object.entries(appSessions)) {
+    if (!s || !s.expiresAt || s.expiresAt <= now) delete appSessions[hash];
+  }
+  const hashes = Object.keys(appSessions);
+  if (hashes.length > 10000) {
+    hashes.sort((a, b) => (appSessions[a].createdAt || 0) - (appSessions[b].createdAt || 0));
+    for (const hash of hashes.slice(0, hashes.length - 10000)) delete appSessions[hash];
+  }
+}
+function createAppSession(data) {
+  pruneAppSessions();
+  const token = crypto.randomBytes(32).toString('base64url');
+  const hash = sessionHash(token);
+  const now = Date.now();
+  appSessions[hash] = Object.assign({}, data, {
+    createdAt: now,
+    expiresAt: now + (data.kind === 'staff' ? SESSION_STAFF_TTL : SESSION_CUSTOMER_TTL),
+  });
+  saveAppSessions();
+  return token;
+}
+function sessionFromRequest(req) {
+  const value = String(req.get('authorization') || '');
+  const match = value.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  const hash = sessionHash(match[1].trim());
+  const session = appSessions[hash];
+  if (!session || session.expiresAt <= Date.now()) {
+    if (session) { delete appSessions[hash]; saveAppSessions(); }
+    return null;
+  }
+  return Object.assign({ tokenHash: hash }, session);
+}
+function requireCustomer(req, res, next) {
+  const session = sessionFromRequest(req);
+  if (!session || session.kind !== 'customer') return res.status(401).json({ error: 'auth_required', message: 'Подтвердите вход заново' });
+  req.appSession = session;
+  next();
+}
+function requireAgent(req, res, next) {
+  const session = sessionFromRequest(req);
+  if (!session || session.kind !== 'customer') return res.status(401).json({ error: 'auth_required', message: 'Подтвердите вход заново' });
+  if (!session.agentId) return res.status(403).json({ error: 'registration_required', message: 'Завершите регистрацию' });
+  req.appSession = session;
+  next();
+}
+function requireStaff(req, res, next) {
+  const session = sessionFromRequest(req);
+  if (!session || session.kind !== 'staff' || !['picker', 'courier', 'admin'].includes(session.role)) {
+    return res.status(401).json({ error: 'staff_auth_required', message: 'Введите PIN сотрудника заново' });
+  }
+  req.appSession = session;
+  next();
+}
+function bindAgentToSession(session, agentId) {
+  if (!session || !session.tokenHash || !appSessions[session.tokenHash]) return;
+  appSessions[session.tokenHash].agentId = agentId;
+  session.agentId = agentId;
+  saveAppSessions();
+}
+function publicAgent(agent) {
+  if (!agent) return null;
+  const id = agent.id || String(agent.meta && agent.meta.href || '').split('/').pop();
+  const attributes = Array.isArray(agent.attributes)
+    ? agent.attributes.filter(a => a && a.name === 'Адреса').map(a => ({ name: 'Адреса', value: a.value }))
+    : undefined;
+  return { id, name: agent.name || '', phone: agent.phone || '', email: agent.email || '', attributes };
+}
+async function fetchAgentById(agentId) {
+  const r = await msFetchLimited(MS_API + '/entity/counterparty/' + encodeURIComponent(agentId), { headers: msAuthHeaders() });
+  if (!r.ok) { const err = new Error('agent_fetch_' + r.status); err.status = r.status; throw err; }
+  return r.json();
+}
+app.get('/api/v2/auth/session', requireCustomer, async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  let agent = null;
+  if (req.appSession.agentId) {
+    try { agent = publicAgent(await fetchAgentById(req.appSession.agentId)); }
+    catch (e) { return res.status(502).json({ error: 'agent_unavailable' }); }
+  }
+  res.json({ ok: true, agentId: req.appSession.agentId || null, email: req.appSession.email || '', agent });
+});
+app.post('/api/v2/auth/logout', (req, res) => {
+  const session = sessionFromRequest(req);
+  if (session) { delete appSessions[session.tokenHash]; saveAppSessions(); }
+  res.json({ ok: true });
+});
+app.post('/api/v2/account/register', requireCustomer, async (req, res) => {
+  try {
+    const fio = String(req.body.fio || '').trim().slice(0, 120);
+    const phone = String(req.body.phone || '').replace(/\D/g, '');
+    const email = String(req.body.email || '').trim().toLowerCase();
+    const birthDate = String(req.body.birthDate || '').trim().slice(0, 30);
+    if (fio.length < 3 || phone.length !== 11) return res.status(400).json({ error: 'Проверьте ФИО и телефон' });
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email) || email !== req.appSession.email) {
+      return res.status(403).json({ error: 'Email должен совпадать с подтверждённым кодом' });
+    }
+    if (req.appSession.agentId) {
+      const existing = publicAgent(await fetchAgentById(req.appSession.agentId));
+      return res.json({ ok: true, clientId: req.appSession.agentId, agent: existing });
+    }
+    const phone10 = phone.slice(-10);
+    const foundR = await msFetchLimited(MS_API + '/entity/counterparty?search=' + encodeURIComponent(phone10) + '&limit=20', { headers: msAuthHeaders() });
+    const found = await foundR.json();
+    const duplicate = (found.rows || []).find(a => String(a.phone || '').replace(/\D/g, '').slice(-10) === phone10);
+    let agent;
+    if (duplicate) {
+      const oldEmail = String(duplicate.email || '').trim().toLowerCase();
+      if (oldEmail && oldEmail !== email) return res.status(409).json({ error: 'Этот телефон уже привязан к другому аккаунту. Войдите по email аккаунта.' });
+      const update = await msFetchLimited(MS_API + '/entity/counterparty/' + duplicate.id, {
+        method: 'PUT', headers: msAuthHeaders(true), body: JSON.stringify({ name: fio, phone, email })
+      });
+      if (!update.ok) return res.status(502).json({ error: 'Не удалось привязать существующий аккаунт' });
+      agent = await update.json();
+    } else {
+      const created = await msFetchLimited(MS_API + '/entity/counterparty', {
+        method: 'POST', headers: msAuthHeaders(true),
+        body: JSON.stringify({ name: fio, companyType: 'individual', phone, email, description: 'Зарегистрирован через приложение Компас. Дата рождения: ' + (birthDate || 'не указана') })
+      });
+      if (!created.ok) return res.status(502).json({ error: 'Не удалось создать аккаунт' });
+      agent = await created.json();
+    }
+    const agentId = agent.id || String(agent.meta && agent.meta.href || '').split('/').pop();
+    if (!agentId) return res.status(502).json({ error: 'Аккаунт создан без идентификатора' });
+    bindAgentToSession(req.appSession, agentId);
+    appSessions[req.appSession.tokenHash].phone = phone;
+    saveAppSessions();
+    res.json({ ok: true, clientId: agentId, agent: publicAgent(agent) });
+  } catch (e) {
+    console.error('ACCOUNT register:', e.message);
+    res.status(500).json({ error: 'Не удалось завершить регистрацию' });
+  }
+});
+app.get('/api/v2/account/profile', requireAgent, async (req, res) => {
+  try { res.json({ ok: true, agent: publicAgent(await fetchAgentById(req.appSession.agentId)) }); }
+  catch (e) { res.status(502).json({ error: 'profile_unavailable' }); }
+});
+app.put('/api/v2/account/profile', requireAgent, async (req, res) => {
+  try {
+    const name = String(req.body.fio || '').trim().slice(0, 120);
+    const phone = String(req.body.phone || '').replace(/\D/g, '');
+    const email = String(req.body.email || req.appSession.email || '').trim().toLowerCase();
+    if (name.length < 3 || phone.length !== 11) return res.status(400).json({ error: 'Проверьте ФИО и телефон' });
+    if (email !== String(req.appSession.email || '').toLowerCase()) return res.status(403).json({ error: 'Для смены email нужно новое подтверждение кодом' });
+    const r = await msFetchLimited(MS_API + '/entity/counterparty/' + req.appSession.agentId, {
+      method: 'PUT', headers: msAuthHeaders(true), body: JSON.stringify({ name, phone, email })
+    });
+    if (!r.ok) return res.status(502).json({ error: 'profile_update_failed' });
+    appSessions[req.appSession.tokenHash].phone = phone;
+    saveAppSessions();
+    res.json({ ok: true, agent: publicAgent(await r.json()) });
+  } catch (e) { res.status(500).json({ error: 'profile_update_failed' }); }
+});
+setInterval(() => { pruneAppSessions(); saveAppSessions(); }, 3600000).unref();
+
 const emailCodes   = new Map(); // email → { hash, expires, attempts }
 const emailSendLog = new Map(); // 'em:'+email / 'ip:'+ip → [timestamps]
 
@@ -1845,8 +2042,15 @@ app.post('/auth/email/verify', async (req, res) => {
     });
     const data = await r.json().catch(() => ({}));
     const agent = (data.rows || []).find(a => (a.email || '').trim().toLowerCase() === email) || null;
+    const agentId = agent && (agent.id || String(agent.meta && agent.meta.href || '').split('/').pop().split('?')[0]);
+    const sessionToken = createAppSession({
+      kind: 'customer', email,
+      agentId: agentId || null,
+      phone: agent && agent.phone || ''
+    });
     console.log('EMAIL AUTH: вход', email, agent ? '→ клиент ' + agent.id : '→ новый пользователь');
-    res.json({ ok: true, agent });
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true, agent: publicAgent(agent), sessionToken });
   } catch(e) {
     console.error('EMAIL AUTH verify:', e.message);
     res.status(500).json({ error: 'Ошибка проверки кода. Попробуйте ещё раз.' });
@@ -2130,7 +2334,9 @@ const ST_DELIVERED = '6b95140d-02a8-11ed-0a80-073c00232c3c'; // ставит к�
 const pickerNotified = new Set();
 let _lastWatch = { at: null, rows: 0, changed: 0, sent: 0, error: null };
 async function watchOrderStatuses() {
-  if (!process.env.MS_TOKEN) return;
+  // Старые подписки могли быть созданы без авторизации — во время lockdown
+  // не отправляем по ним данные заказов и не запускаем рабочие уведомления.
+  if (SECURITY_LOCKDOWN || !process.env.MS_TOKEN) return;
   if (!process.env.TG_BOT_TOKEN && !pushEnabled() && !maxEnabled()) return; // ни одного канала уведомлений
   try {
     const r = await msFetchLimited(MS_API + '/entity/customerorder?limit=100&order=updated,desc&expand=state,agent', { headers: msAuthHeaders() });
@@ -2194,7 +2400,20 @@ async function watchOrderStatuses() {
   }
 }
 setInterval(watchOrderStatuses, 30000);
-maxPollLoop(); // MAX-бот: слушаем нажатия «Принять заказ» (long polling, вебхук не нужен)
+// Внешние рабочие операции закрыты — старые callback-кнопки MAX тоже не должны
+// принимать/завершать заказы до появления серверной авторизации сотрудников.
+if (!SECURITY_LOCKDOWN) maxPollLoop();
+
+// MAX-бот каталога для покупателей (отдельный токен, только публичные цены/остатки)
+if (process.env.MAX_CATALOG_BOT_TOKEN) {
+  try {
+    require('./max-catalog-bot').start({
+      token: process.env.MAX_CATALOG_BOT_TOKEN,
+      getCatalog: () => (priceCatalogCache && priceCatalogCache.payload) || null,
+      getStock: () => (priceStockCache && priceStockCache.payload) || null,
+    });
+  } catch (e) { console.warn('MAX catalog bot:', e.message); }
+}
 
 // ── СТОРОЖ БРОШЕННЫХ ОПЛАТ ──
 // Заказ создаётся в МС до оплаты (иначе при сбое возврата из банка были бы «деньги без заказа»).
@@ -2221,7 +2440,9 @@ async function msSetOrderState(orderId, stateId) {
 }
 let _abandonedBusy = false;
 async function reconcileAbandonedPayments() {
-  if (_abandonedBusy || !process.env.MS_TOKEN) return;
+  // Старая сверка не проверяет сумму и валюту платежа. До исправления этого
+  // правила она не должна сама переводить заказы в оплаченные/к курьеру.
+  if (SECURITY_LOCKDOWN || _abandonedBusy || !process.env.MS_TOKEN) return;
   let creds; try { creds = alfaCredentials(); } catch(e) { return; }
   _abandonedBusy = true;
   try {
@@ -2317,8 +2538,9 @@ async function reconcileAbandonedPayments() {
 }
 setInterval(reconcileAbandonedPayments, 60000);
 
-// Диагностика уведомлений: состояние наблюдателя + тест отправки (?send=<chatId>)
+// Диагностика уведомлений доступна только с DIAG_KEY в заголовке x-diag-key.
 app.get('/tg/debug', async (req, res) => {
+  if (!diagGate(req, res)) return;
   var sborka = getSborkaUsers();
   const out = {
     baseline: orderWatchBaseline,
@@ -2363,12 +2585,23 @@ app.post('/sborka/login', (req, res) => {
   if (a.n >= 10) return res.status(429).json({ error: 'Слишком много попыток. Подождите 15 минут.' });
   const pin = (req.body.pin || '').trim();
   const pickers = getSborkaUsers();
-  if (pickers[pin]) { a.n = 0; sborkaLoginAttempts.set(ip, a); return res.json({ ok: true, name: pickers[pin], pin, role: 'picker' }); }
   const couriers = getCourierUsers();
-  if (couriers[pin]) { a.n = 0; sborkaLoginAttempts.set(ip, a); return res.json({ ok: true, name: couriers[pin], pin, role: 'courier' }); }
+  const role = pickers[pin] ? 'picker' : (couriers[pin] ? 'courier' : null);
+  const name = role === 'picker' ? pickers[pin] : (role === 'courier' ? couriers[pin] : null);
+  if (role) {
+    a.n = 0;
+    sborkaLoginAttempts.set(ip, a);
+    const sessionToken = createAppSession({ kind: 'staff', role, name });
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, name, role, sessionToken });
+  }
   a.n++;
   sborkaLoginAttempts.set(ip, a);
   res.status(401).json({ error: 'Неверный PIN-код' });
+});
+app.get('/api/v2/staff/session', requireStaff, (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, name: req.appSession.name, role: req.appSession.role });
 });
 
 /* ── ПУБЛИЧНЫЙ ПРАЙС-ЛИСТ ──────────────────────────────────────────────
@@ -2391,6 +2624,13 @@ let priceCatalogPending = null;
 let priceStockPending = null;
 let priceCatalogError = '';
 let priceStockError = '';
+// Диагностика обновлений для /price/health: сколько попыток, когда последний
+// успех, когда и какая была последняя ошибка. 16.11.2026 прайс молча замёрз
+// на сутки — с этими полями такое видно сразу.
+const priceStats = {
+  catalog: { attempts: 0, lastOkAt: null, lastErrorAt: null },
+  stock:   { attempts: 0, lastOkAt: null, lastErrorAt: null }
+};
 
 function priceVersion(data) {
   return crypto.createHash('sha1').update(JSON.stringify(data)).digest('hex').slice(0, 16);
@@ -2518,6 +2758,7 @@ async function priceLoadCatalog() {
     }
     items.push({
       id, hrefId, name, sourceName: String(p.name || ''), category, subcategory,
+      article: String(p.article || '').trim(),
       originalPrice: Math.round(originalPrice * 100) / 100,
       price: Math.round(price * 100) / 100,
       discountPercent: discount ? discount.percent : 0,
@@ -2533,7 +2774,9 @@ async function priceLoadStock() {
   const quantities = {};
   rows.forEach(row => {
     const storeRow = (row.stockByStore || []).find(s => priceHrefId(s.meta) === PRICE_STORE_ID);
-    const qty = storeRow ? Math.max(0, parseFloat(storeRow.stock) || 0) : 0;
+    // Наличие для покупателя = физический остаток минус резерв под заказы:
+    // полностью зарезервированный товар не должен светиться в прайсе.
+    const qty = storeRow ? Math.max(0, (parseFloat(storeRow.stock) || 0) - (parseFloat(storeRow.reserve) || 0)) : 0;
     [priceUuid(row.meta), priceHrefId(row.meta)].filter(Boolean).forEach(id => {
       quantities[id] = (quantities[id] || 0) + qty;
     });
@@ -2544,15 +2787,31 @@ async function priceLoadStock() {
   Object.keys(quantities).forEach(id => { items[id] = quantities[id] > 0; });
   return items;
 }
+// Жёсткий таймаут на загрузку данных МойСклад: 16.11.2026 фоновое обновление
+// зависло навсегда (pending-promise не завершился и не упал), и прайс замёрз
+// на сутки без единой ошибки в /price/health. Теперь загрузка обязана
+// завершиться: либо данными, либо видимой ошибкой — и цикл пойдёт дальше.
+const PRICE_LOAD_TIMEOUT_MS = Math.max(30000, parseInt(process.env.PRICE_LOAD_TIMEOUT_MS || '120000', 10));
+function priceLoadWithTimeout(isCatalog) {
+  const loader = isCatalog ? priceLoadCatalog() : priceLoadStock();
+  return Promise.race([
+    loader,
+    msSleep(PRICE_LOAD_TIMEOUT_MS).then(() => {
+      throw new Error('МойСклад не ответил за ' + Math.round(PRICE_LOAD_TIMEOUT_MS / 1000) + ' с (таймаут загрузки прайса)');
+    })
+  ]);
+}
 function priceRefresh(kind, force) {
   const isCatalog = kind === 'catalog';
   let cache = isCatalog ? priceCatalogCache : priceStockCache;
-  let pending = isCatalog ? priceCatalogPending : priceStockPending;
+  const pending = isCatalog ? priceCatalogPending : priceStockPending;
   const ttl = isCatalog ? PRICE_CATALOG_TTL : PRICE_STOCK_TTL;
   if (!force && cache && Date.now() - cache.payload.checkedAt < ttl) return Promise.resolve();
   if (pending) return pending;
-  pending = (async () => {
-    const items = isCatalog ? await priceLoadCatalog() : await priceLoadStock();
+  const stats = isCatalog ? priceStats.catalog : priceStats.stock;
+  stats.attempts++;
+  const p = (async () => {
+    const items = await priceLoadWithTimeout(isCatalog);
     const version = priceVersion(items);
     const now = Date.now();
     cache = isCatalog ? priceCatalogCache : priceStockCache;
@@ -2573,18 +2832,22 @@ function priceRefresh(kind, force) {
     }
     if (isCatalog) priceCatalogError = '';
     else priceStockError = '';
+    stats.lastOkAt = new Date(now).toISOString();
   })().catch(e => {
     // Важно: старый кэш НЕ очищаем — посетители не увидят пустую страницу.
     if (isCatalog) priceCatalogError = e.message;
     else priceStockError = e.message;
+    stats.lastErrorAt = new Date().toISOString();
     console.warn('PRICE', kind, 'refresh failed:', e.message);
   }).finally(() => {
-    if (isCatalog) priceCatalogPending = null;
-    else priceStockPending = null;
+    // Снимаем блокировку, только если pending — всё ещё НАШ запрос,
+    // чтобы случайно не сбросить более свежий.
+    if (isCatalog) { if (priceCatalogPending === p) priceCatalogPending = null; }
+    else { if (priceStockPending === p) priceStockPending = null; }
   });
-  if (isCatalog) priceCatalogPending = pending;
-  else priceStockPending = pending;
-  return pending;
+  if (isCatalog) priceCatalogPending = p;
+  else priceStockPending = p;
+  return p;
 }
 async function priceSend(req, res, kind) {
   const isCatalog = kind === 'catalog';
@@ -2612,16 +2875,42 @@ async function priceSend(req, res, kind) {
 }
 app.get('/price/catalog', (req, res) => priceSend(req, res, 'catalog'));
 app.get('/price/stock', (req, res) => priceSend(req, res, 'stock'));
+
 app.get('/price/health', (req, res) => res.json({
   ok: !!(priceCatalogCache && priceStockCache),
   catalogCount: priceCatalogCache ? priceCatalogCache.payload.items.length : 0,
   stockCount: priceStockCache ? Object.keys(priceStockCache.payload.items).length : 0,
   catalogVersion: priceCatalogCache && priceCatalogCache.payload.version,
   stockVersion: priceStockCache && priceStockCache.payload.version,
+  catalogUpdatedAt: priceCatalogCache && priceCatalogCache.payload.updatedAt,
+  stockUpdatedAt: priceStockCache && priceStockCache.payload.updatedAt,
   catalogError: priceCatalogError || null,
   stockError: priceStockError || null,
+  catalogStats: priceStats.catalog,
+  stockStats: priceStats.stock,
+  refreshing: { catalog: !!priceCatalogPending, stock: !!priceStockPending },
   store: 'Компас.Доставка'
 }));
+// Ручной перезапуск обновления прайса. Данные публичные, ключ не нужен.
+// Полезно после списаний и приходов, чтобы не ждать TTL. ?kind=stock|catalog
+app.get('/price/refresh', async (req, res) => {
+  const kind = String(req.query.kind || 'both');
+  const jobs = [];
+  if (kind === 'both' || kind === 'catalog') jobs.push(priceRefresh('catalog', true));
+  if (kind === 'both' || kind === 'stock') jobs.push(priceRefresh('stock', true));
+  if (!jobs.length) return res.status(400).json({ error: 'kind: stock | catalog | both' });
+  // Загрузка из МойСклад может занять десятки секунд — не держим HTTP-ответ дольше.
+  await Promise.race([Promise.all(jobs), msSleep(30000)]);
+  res.json({
+    ok: !priceCatalogError && !priceStockError,
+    catalogVersion: priceCatalogCache && priceCatalogCache.payload.version,
+    stockVersion: priceStockCache && priceStockCache.payload.version,
+    catalogUpdatedAt: priceCatalogCache && priceCatalogCache.payload.updatedAt,
+    stockUpdatedAt: priceStockCache && priceStockCache.payload.updatedAt,
+    catalogError: priceCatalogError || null,
+    stockError: priceStockError || null
+  });
+});
 // Фоновые часы: TTL проверяется каждые 3 секунды, сами данные обновляются реже.
 setInterval(() => { priceRefresh('catalog', false); }, 3000);
 setInterval(() => { priceRefresh('stock', false); }, 3000);
